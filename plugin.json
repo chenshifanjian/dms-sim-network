@@ -1,0 +1,18 @@
+{
+    "id": "simNetwork",
+    "name": "SIM Network",
+    "description": "管理 4G 模块：流量与实时网速、短信/彩信收发、基站与 GPS 定位、桌面通知与 Obsidian 归档",
+    "version": "0.3.0",
+    "author": "chenshifanjian",
+    "type": "composite",
+    "capabilities": ["daemon", "control-center", "dankbar-widget"],
+    "components": {
+        "daemon": "./Store.qml",
+        "widget": "./ModemWidget.qml"
+    },
+    "settings": "./ModemSettings.qml",
+    "startupCheck": "./StartupCheck.qml",
+    "icon": "signal_cellular_alt",
+    "dependencies": ["mmcli", "nmcli"],
+    "permissions": ["process", "settings_read", "settings_write"]
+}
