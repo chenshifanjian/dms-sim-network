@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""把 mmsd-tng 落盘的彩信 PDU 解析成结构化数据 + 抠出附件。
+
+mmsd-tng 把每条彩信以**原始 MMS PDU**（WSP 二进制）存放在 ~/.mms/modemmanager/<hash>，
+同目录 <hash>.status 记录状态（read / state / date / expiration）。
+
+完整解析 WSP 二进制是不必要的工作量；实测 PDU 里：
+  · 发件人号码是明文的，形如 +861XXXXXXXXX/TYPE=PLMN
+  · 附件（JPEG/PNG/GIF…）是裸数据，按文件头签名即可抠出
+  · 文本部分通常是 UTF-8（中国运营商），偶尔 GBK
+所以用「明文提取 + 魔数抠图」即可得到可靠结果，且不依赖 mmsd 的 D-Bus 接口
+（其对象路径会随守护进程重启变化，不可靠）。
+
+用法:
+  mms-export                      # 打印 JSON 到 stdout
+  mms-export --json /path/out.json
+  mms-export --outdir /path/att   # 附件输出目录（默认 ~/.local/state/simNetwork/mms-att）
+  mms-export --save-attachments   # 配合 --outdir 才写文件；不加则只记录将去哪儿
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import struct
+import sys
+from datetime import datetime, timezone
+
+MMSD_DIR = os.path.expanduser("~/.mms/modemmanager")
+DEFAULT_ATTDIR = os.path.expanduser("~/.local/state/simNetwork/mms-att")
+
+# 附件签名的 (头部, 扩展名, 尾部, mime)
+SIGNATURES = (
+    (b"\xff\xd8\xff", "jpg", b"\xff\xd9", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "png", b"IEND\xaeB`\x82", "image/png"),
+    (b"GIF89a", "gif", b"\x3b", "image/gif"),
+    (b"GIF87a", "gif", b"\x3b", "image/gif"),
+    (b"RIFF", "webp", None, "image/webp"),
+    (b"\x00\x00\x00\x18ftyp", "mp4", None, "video/mp4"),
+    (b"\x00\x00\x00\x20ftyp", "mp4", None, "video/mp4"),
+    (b"#!AMR", "amr", None, "audio/amr"),
+    (b"\x23\x21AMR", "amr", None, "audio/amr"),
+    (b"ID3", "mp3", None, "audio/mpeg"),
+)
+
+PHONE_RE = re.compile(rb"(\+?\d{5,20})/TYPE=PLMN")
+
+
+def normalize_cn_number(raw: str) -> str:
+    """把号码统一成"国内形式"，好和短信记录归到同一个会话。
+
+    运营商在彩信 PDU 里写的是 +861XXXXXXXXX / 861XXXXXXXXXX，
+        而短信（mmcli）给的是 1XXXXXXXXXX —— 不统一就会分出两个会话。
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    for prefix in ("0086", "86"):
+        if digits.startswith(prefix) and len(digits) - len(prefix) == 11:
+            return digits[len(prefix):]
+    return digits
+
+
+FILENAME_RE = re.compile(
+    # 文件名里可能含中文（UTF-8 多字节），bytes 正则不能用 \u 转义，用 \x80-\xff 覆盖
+    rb"([A-Za-z0-9_\-\x80-\xff]{1,64}\.(?:jpg|jpeg|png|gif|webp|mp4|3gp|amr|mp3|txt))",
+    re.IGNORECASE,
+)
+
+
+def read_status(path: str) -> dict:
+    st = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    st[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return st
+
+
+def find_attachments(pdu: bytes):
+    """按魔数定位附件，返回 [(start, end, ext, mime, blob)]。"""
+    out = []
+    for head, ext, tail, mime in SIGNATURES:
+        start = pdu.find(head)
+        while start != -1:
+            if tail:
+                end = pdu.rfind(tail, start)
+                end = end + len(tail) if end != -1 else len(pdu)
+            else:
+                end = len(pdu)
+            if end - start >= 1024:          # 太小的当误报
+                out.append((start, end, ext, mime, pdu[start:end]))
+            start = pdu.find(head, start + 1)
+    # 去掉被更大附件包含的重复命中
+    out.sort(key=lambda t: (t[0], -t[1]))
+    pruned = []
+    for item in out:
+        if pruned and item[0] >= pruned[-1][0] and item[1] <= pruned[-1][1]:
+            continue
+        pruned.append(item)
+    return pruned
+
+
+def extract_text(pdu: bytes, skip_ranges) -> str:
+    """抽取正文文本。
+
+    必须先把附件（JPEG/PNG…）的字节区间挖掉——否则图片数据会被当成连续可打印
+    字节解码成一串乱码。剩余部分里找最长的、像真人文本的片段。
+    """
+    keep = bytearray()
+    pos = 0
+    for start, end in sorted(skip_ranges):
+        if start > pos:
+            keep += pdu[pos:start]
+        pos = max(pos, end)
+    if pos < len(pdu):
+        keep += pdu[pos:]
+    data = bytes(keep)
+
+    runs = []
+    run = bytearray()
+    for b in data:
+        if 0x20 <= b != 0x7F:
+            run.append(b)
+        else:
+            if run:
+                runs.append(bytes(run))
+            run = bytearray()
+    if run:
+        runs.append(bytes(run))
+
+    best = ""
+    for raw in runs:
+        if len(raw) < 2:
+            continue
+        text = ""
+        for enc in ("utf-8", "gbk"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if not text:
+            continue
+        if "TYPE=PLMN" in text or "http://" in text or "https://" in text:
+            continue
+        # MMS 的 WSP 头里满是 MIME 类型/布局名，别当成正文
+        if re.search(r"(application|image|text|audio|video|multipart|message)\s*/"
+                     r"(smil|jpeg|jpg|png|gif|plain|vnd|mixed|related)", text, re.I):
+            continue
+        if re.search(r"\b(smil|jpeg|wbxml|charset|utf-8|TYPE=PLMN)\b", text, re.I):
+            continue
+        # 附件文件名 / SMIL 布局名（如 temp.jpg、smil.xml）也不是正文
+        if re.search(r"\.(jpg|jpeg|png|gif|xml|smil|wbmp|amr|mp4|3gp|txt)\b", text, re.I):
+            continue
+        if re.search(r"\bxml\b|\bsmil\b", text, re.I):
+            continue
+        if re.fullmatch(r"[\x20-\x7e]+", text) and (
+            text.startswith("+") or re.fullmatch(r"[A-Za-z0-9_\-\.]+", text)
+            or "/" in text
+        ):
+            continue
+        meaningful = len(re.findall(r"[A-Za-z\u4e00-\u9fff]", text))
+        if meaningful < 2 or meaningful / max(1, len(text)) < 0.5:
+            continue          # 乱码通常"非文字字符"占比很高
+        # 真人文本的特征：连续汉字，或小写英文单词。
+        # PDU 事务 ID（如 VW6fWn8PAA）、WSP 头片段都是大小写混杂的随机串，会被挡掉。
+        if not (re.search(r"[\u4e00-\u9fff]{3,}", text) or re.search(r"[a-z]{3,}", text)):
+            continue
+        if len(text) > len(best):
+            best = text
+    return best.strip()
+
+
+def carve_attachments(found, msg_id: str, outdir: str, save: bool):
+    out = []
+    for idx, (_start, _end, ext, mime, blob) in enumerate(found):
+        fname = f"{msg_id}.{ext}" if idx == 0 else f"{msg_id}-{idx + 1}.{ext}"
+        fpath = os.path.join(outdir, fname)
+        if save:
+            os.makedirs(outdir, exist_ok=True)
+            if not os.path.exists(fpath) or os.path.getsize(fpath) != len(blob):
+                with open(fpath, "wb") as fh:
+                    fh.write(blob)
+        out.append({"path": fpath, "name": fname, "mime": mime,
+                    "bytes": len(blob), "saved": bool(save)})
+    return out
+
+
+def parse_message(pdu_path: str, outdir: str, save: bool) -> dict:
+    msg_id = os.path.basename(pdu_path)
+    with open(pdu_path, "rb") as fh:
+        pdu = fh.read()
+
+    status = read_status(pdu_path + ".status")
+
+    m = PHONE_RE.search(pdu)
+    sender = m.group(1).decode() if m else ""
+    # PDU 里可能有多个号码（收件人列表），第一个通常是发件人
+    nums = [x.decode() for x in PHONE_RE.findall(pdu)]
+
+    date = status.get("date", "")
+    if not date:
+        ts = os.path.getmtime(pdu_path)
+        date = datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+        date = date[:-2] + ":" + date[-2:] if len(date) >= 5 else date
+
+    names = [x.decode(errors="replace") for x in FILENAME_RE.findall(pdu)]
+
+    found = find_attachments(pdu)
+    ranges = [(s, e) for s, e, _ext, _mime, _blob in found]
+
+    return {
+        "id": msg_id,
+        "path": pdu_path,
+        "from": sender,
+        # 归入同一会话用的号码：统一成国内形式（去 +86/86/0086）
+        "number": normalize_cn_number(sender),
+        "name": normalize_cn_number(sender),
+        "numbers": nums,
+        "date": date,
+        "state": status.get("state", ""),
+        "read": status.get("read", ""),
+        "expiration": status.get("expiration", ""),
+        "bytes": len(pdu),
+        "text": extract_text(pdu, ranges),
+        "filenames": names[:4],
+        "attachments": carve_attachments(found, msg_id, outdir, save),
+        "isSubmit": False,
+        "kind": "mms",
+    }
+
+
+def load_messages(outdir: str, save: bool) -> list:
+    if not os.path.isdir(MMSD_DIR):
+        return []
+    out = []
+    for name in sorted(os.listdir(MMSD_DIR)):
+        path = os.path.join(MMSD_DIR, name)
+        if not os.path.isfile(path) or name.endswith(".status") or name == "mms":
+            continue
+        try:
+            if os.path.getsize(path) < 64:
+                continue
+            out.append(parse_message(path, outdir, save))
+        except OSError as exc:
+            print(f"跳过 {name}: {exc}", file=sys.stderr)
+    out.sort(key=lambda m: m.get("date") or "", reverse=True)
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="解析 mmsd-tng 落盘的彩信 PDU")
+    ap.add_argument("--json", help="把结果写到该 JSON 文件")
+    ap.add_argument("--outdir", default=DEFAULT_ATTDIR, help="附件输出目录")
+    ap.add_argument("--save-attachments", action="store_true", help="真正写出附件文件")
+    args = ap.parse_args()
+
+    msgs = load_messages(args.outdir, args.save_attachments)
+    payload = {
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "count": len(msgs),
+        "messages": msgs,
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=1)
+    if args.json:
+        os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
+        with open(args.json, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print(f"✓ 已写入 {args.json}（{len(msgs)} 条彩信，附件保存={args.save_attachments}）")
+    else:
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

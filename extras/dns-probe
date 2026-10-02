@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""直接向指定 DNS 服务器查询 mmsc.vnet.mobi 的 A 记录（绕过系统 DNS / VPN fake-IP）。
+
+用途：mmsd-tng 用 c-ares + 模块承载下发的 DNS（240e:4c:4808::1 / 222.222.202.202 等）
+去解析彩信中心域名。系统侧被 Clash 的 fake-IP（198.18.0.0/15）劫持，
+所以要直接问运营商 DNS 才能知道真实情况。
+"""
+import socket
+import struct
+import random
+import sys
+
+
+def query(name: str, server: str, timeout: float = 4.0):
+    tid = random.randint(0, 65535)
+    header = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+    qname = b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\x00"
+    packet = header + qname + struct.pack(">HH", 1, 1)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(packet, (server, 53))
+        data, _ = sock.recvfrom(1024)
+        ancount = struct.unpack(">H", data[6:8])[0]
+        if ancount == 0:
+            return ["(无 A 记录)"]
+        i = 12
+        while data[i] != 0:
+            i += data[i] + 1
+        i += 5
+        ips = []
+        for _ in range(ancount):
+            while i < len(data) and (data[i] & 0xC0) != 0xC0:
+                if data[i] == 0:
+                    break
+                i += data[i] + 1
+            if i < len(data) and (data[i] & 0xC0) == 0xC0:
+                i += 2
+            rtype, _, _ttl, rdlen = struct.unpack(">HHIH", data[i:i + 10])
+            i += 10
+            if rtype == 1 and rdlen == 4:
+                ips.append(".".join(str(b) for b in data[i:i + 4]))
+            i += rdlen
+        return ips or ["(无 A 记录)"]
+    except Exception as exc:            # noqa: BLE001 - 诊断脚本，任何失败都要显示
+        return [f"失败: {exc}"]
+    finally:
+        sock.close()
+
+
+if __name__ == "__main__":
+    target = sys.argv[1] if len(sys.argv) > 1 else "mmsc.vnet.mobi"
+    servers = sys.argv[2:] or ["222.222.202.202", "222.222.222.222", "114.114.114.114"]
+    for srv in servers:
+        print(f"  {srv:>16} → {query(target, srv)}")

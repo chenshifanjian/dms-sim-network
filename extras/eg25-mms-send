@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""用 EG25-G 模块原生的 MMS AT 命令发送彩信。
+
+为什么不走 mmsd-tng：实测电信彩信中心拒绝一切 POST（502），因为彩信提交必须
+经 WAP 内网网关（10.0.0.200:80），而该网关从普通数据 APN 不可达。模块自带的
+MMS 协议栈会自己激活彩信专用 PDP（ctwap）并在模块内部完成整个 MMS 事务——
+这正是手机发彩信的方式。
+
+流程（依据厂商《MMS 应用指导 V1.1》§1.2 / §3.6）：
+  1) AT+QICSGP 配置 ctnet/ctwap 上下文 → AT+QIACT 激活 → QMMSCFG="contextid"
+  2) QMMSCFG="mmsc" / "proxy"
+  3) QFUPL 把图片上传到模块 RAM
+  4) QMMSEDIT 填收件人 + 附件
+  5) QMMSEND 发送，读 +QMMSEND: <err>,<httprsp>[,<mmsrsp>]
+
+用法:
+  eg25-mms-send <收件人号码> <图片路径> [--subject 标题] [--timeout 180]
+  eg25-mms-send --setup-only          # 只配置并激活上下文（不发送）
+  eg25-mms-send --status              # 打印当前 MMS 配置
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+try:
+    import serial
+except ImportError:
+    sys.exit("需要 pyserial：python3 -m pip install pyserial")
+
+AT_PORT = os.environ.get("EG25_AT_PORT", "/dev/ttyUSB2")
+# 用独立 PDP 上下文。cid 1 已被 ModemManager 的 ctnet 占用，5 是 IMS，
+# 所以取空闲的 2，避免和上网连接互相踢掉。
+MMS_CONTEXT = int(os.environ.get("EG25_MMS_CONTEXT", "2"))
+MMS_APN = "ctwap"                    # 电信彩信专用 APN（上网是 ctnet）
+MMS_APN_USER = "ctwap@mycdma.cn"
+MMS_APN_PASS = "vnet.mobi"
+MMS_APN_AUTH = 1
+# 彩信中心：域名 mmsc.vnet.mobi 在任何公共 DNS 都解析不了，用实测可达的 IP
+MMSC = os.environ.get("EG25_MMSC", "http://10.234.48.185")
+MMS_PROXY = os.environ.get("EG25_MMS_PROXY", "10.0.0.200")
+MMS_PROXY_PORT = int(os.environ.get("EG25_MMS_PROXY_PORT", "80"))
+RAM_FILE = "RAM:mms_out.jpg"
+
+
+MAX_UPLOAD_BYTES = int(os.environ.get("EG25_MMS_MAX_BYTES", "100000"))
+
+
+def shrink_image(src: str, max_bytes: int = MAX_UPLOAD_BYTES) -> str:
+    """把图片压到模块文件系统放得下的大小（模块 UFS/RAM 都很小）。
+
+    模块 UFS 只剩 ~220KB、RAM 只剩 ~128KB，直接传 120KB+ 的照片会报 6538
+    （空间不足）。手机发彩信本身也会压缩，这里按最长的边逐级降尺寸/质量。
+    """
+    if os.path.getsize(src) <= max_bytes:
+        return src
+    tool = shutil.which("magick") or shutil.which("convert")
+    if not tool:
+        print(f"  ! 图片 {os.path.getsize(src)} 字节，无 ImageMagick 无法压缩")
+        return src
+    out = os.path.join(tempfile.gettempdir(), "mms_resized.jpg")
+    for edge, quality in ((1600, 85), (1280, 80), (1024, 75), (800, 70), (640, 60), (480, 55)):
+        subprocess.run([tool, src, "-resize", f"{edge}x{edge}>", "-quality",
+                        str(quality), out],
+                       capture_output=True, timeout=60)
+        if os.path.isfile(out) and os.path.getsize(out) <= max_bytes:
+            print(f"  压缩: {os.path.getsize(src)} → {os.path.getsize(out)} 字节"
+                  f"（最长边 {edge}px, 质量 {quality}）")
+            return out
+    print(f"  ! 压到最小仍大于 {max_bytes} 字节，仍尝试发送")
+    return out if os.path.isfile(out) else src
+
+
+def run(cmd: list[str]) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
+    except Exception:                      # noqa: BLE001
+        return ""
+
+
+MM_FLAG = "/tmp/eg25-mm-stopped"          # 标记「我们停过 MM」，供兜底与自愈使用
+# 注意：不能放 /run（root 目录，普通用户写不进去，标记会静默丢失）
+
+
+def mm_stopped_by_us() -> bool:
+    return os.path.exists(MM_FLAG)
+
+
+def mm_stop() -> None:
+    # 先写标记再停服务：反过来的话，恰好在「已停、未写」那一瞬被 SIGKILL
+    # 就再也没有任何线索能证明是我们停的了（几毫秒的窗口，但真实存在）。
+    try:
+        with open(MM_FLAG, "w") as fh:
+            fh.write(f"{os.getpid()}:{int(time.time())}")
+    except Exception:                      # noqa: BLE001
+        pass
+    run(["sudo", "-n", "systemctl", "stop", "ModemManager"])
+    if not mm_stopped_by_us():             # 极端情况：标记没写成功就别留隐患
+        pass
+
+
+def mm_start() -> None:
+    run(["sudo", "-n", "systemctl", "start", "ModemManager"])
+    try:
+        os.unlink(MM_FLAG)
+    except Exception:                      # noqa: BLE001
+        pass
+
+
+def mm_rescue_if_needed() -> None:
+    """供外部/本脚本调用：如果标记还在但 MM 已经停了，把它救回来。"""
+    if not mm_stopped_by_us():
+        return
+    active = run(["systemctl", "is-active", "ModemManager"]).strip()
+    if active != "active":
+        print("  ! 检测到上次运行异常中断（ModemManager 仍停着），正在恢复 …")
+        mm_start()
+
+
+def _emergency_restore(*_a) -> None:
+    """被 SIGTERM/SIGINT/SIGHUP 打断时也要把 ModemManager 起回来。"""
+    mm_start()
+
+
+import atexit                                                    # noqa: E402
+import signal as _signal                                         # noqa: E402
+atexit.register(_emergency_restore)
+for _sig in (_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP):
+    try:
+        _signal.signal(_sig, lambda *_a: (_emergency_restore(), sys.exit(130)))
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def verify_uploaded(text: str, remote: str, size: int):
+    """从 AT 输出里判断文件是否真的写进模块了。
+
+    模块列目录时会把 "UFS:" 前缀去掉（回 "mms_out.jpg"），也可能保留
+    （RAM 会回 "RAM:mms_out.jpg"），所以按 basename 模糊匹配。
+    返回 (是否符合预期大小, 模块报告的大小或 -1)。
+    """
+    base = os.path.basename(remote.split(":", 1)[-1])
+    m = re.search(r'\+QFLST:\s*"[^"]*' + re.escape(base) + r'",\s*(\d+)', text or "")
+    if not m:
+        return False, -1
+    return int(m.group(1)) == size, int(m.group(1))
+
+
+class Modem:
+    def __init__(self, port: str, quiet: bool = False):
+        self.quiet = quiet
+        self.ser = serial.Serial(port, 115200, timeout=1)
+        time.sleep(0.3)
+        self.ser.reset_input_buffer()
+        self.at("AT", 3)
+        # 关回显：否则上传图片时模块会把二进制回显回来，响应里全是噪声
+        self.at("ATE0", 3)
+
+    def close(self) -> None:
+        try:
+            self.ser.close()
+        except Exception:                  # noqa: BLE001
+            pass
+
+    def _read_until(self, patterns, timeout: float) -> str:
+        buf = ""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                chunk = self.ser.read(4096)
+            except Exception:              # noqa: BLE001
+                break
+            if chunk:
+                buf += chunk.decode("utf-8", "replace")
+                for p in patterns:
+                    if re.search(p, buf):
+                        return buf
+            else:
+                time.sleep(0.05)
+        return buf
+
+    def raw(self, line: str, timeout: float = 10.0, wait=r"\r\n(OK|ERROR)\r\n") -> str:
+        self.ser.write((line + "\r").encode())
+        out = self._read_until([wait], timeout)
+        if not self.quiet:
+            for ln in out.replace("\r", "").split("\n"):
+                if ln.strip():
+                    print(f"    {ln.strip()}")
+        return out
+
+    def at(self, line: str, timeout: float = 10.0) -> str:
+        return self.raw(line, timeout)
+
+    def fs_space(self, fs: str):
+        """返回 (已用, 总量)，读不到返回 None。"""
+        out = self.raw(f'AT+QFLDS="{fs}"', 8)
+        m = re.search(r'\+QFLDS:\s*"[A-Z]+",\s*(\d+),\s*(\d+)', out)
+        return (int(m.group(1)), int(m.group(2))) if m else None
+
+    def upload(self, local_path: str, remote: str, timeout: int = 120,
+               ackmode: int = 0) -> bool:
+        size = os.path.getsize(local_path)
+        with open(local_path, "rb") as fh:
+            blob = fh.read()
+        print(f"  上传 {size} 字节 → {remote}（ackmode={ackmode}）")
+        self.ser.write(f'AT+QFUPL="{remote}",{size},{timeout},{ackmode}\r'.encode())
+        got = self._read_until([r"CONNECT"], 20)
+        if "CONNECT" not in got:
+            print("    ✗ 未进入上传模式：", got.replace("\r", " ").strip()[:200])
+            return False
+        self.ser.write(blob)
+        out = self._read_until([r"\+QFUPL:", r"ERROR"], timeout)
+        if not self.quiet:
+            for ln in out.replace("\r", "").split("\n"):
+                if ln.strip():
+                    print(f"    {ln.strip()}")
+        # +QFUPL 第二个字段实测是校验值（十六进制），不是错误码——不要用它判断成败。
+        # 直接问模块：文件在不在、大小对不对。
+        # 注意：列目录时模块会把 "UFS:" 前缀去掉（只回文件名），所以按 basename 匹配。
+        # 关键：raw() 会把响应读走并打印，必须接住它的返回值再搜，
+        # 否则搜索的是空字符串（这个坑踩过一次）。
+        text = out
+        text += self.raw(f'AT+QFLST="{remote.split(":", 1)[0]}:*"', 10)
+        text += self.raw('AT+QFLST="UFS:*"', 10)
+        text += self.raw('AT+QFLST="RAM:*"', 10)
+        ok, actual = verify_uploaded(text, remote, size)
+        if ok:
+            print(f"    ✓ 模块里确认存在 {os.path.basename(remote)}：{actual} 字节，与本地一致")
+            return True
+        if actual >= 0:
+            print(f"    ✗ 大小不符：模块 {actual} vs 本地 {size}")
+        else:
+            print(f"    ✗ 列表里找不到 {os.path.basename(remote)}"
+                  f"（QFUPL 报告收到 {re.search(r'[+]QFUPL:[ ]*(\d+)', out).group(1) if re.search(r'[+]QFUPL:[ ]*(\d+)', out) else '?'} 字节）")
+        return False
+
+
+def setup(m: Modem, activate: bool = True) -> bool:
+    print("① 配置并激活彩信专用 PDP 上下文")
+    m.at(f'AT+QICSGP={MMS_CONTEXT},1,"{MMS_APN}","{MMS_APN_USER}","{MMS_APN_PASS}",{MMS_APN_AUTH}')
+    if activate:
+        out = m.at(f"AT+QIACT={MMS_CONTEXT}", 30)
+        if "ERROR" in out:
+            print("   （上下文可能已激活，继续）")
+    m.at("AT+QIACT?")
+    m.at(f'AT+QMMSCFG="contextid",{MMS_CONTEXT}')
+    print("② 配置彩信中心与 WAP 代理")
+    m.at(f'AT+QMMSCFG="mmsc","{MMSC}"', 8)
+    m.at(f'AT+QMMSCFG="proxy","{MMS_PROXY}",{MMS_PROXY_PORT}', 8)
+    m.at('AT+QMMSCFG="sendparam",6,2,0,0,2,4', 8)
+    return True
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="用模块原生 AT 发送彩信")
+    ap.add_argument("number", nargs="?", help="收件人号码")
+    ap.add_argument("image", nargs="?", help="图片路径")
+    ap.add_argument("--subject", default="", help="标题（ASCII）")
+    ap.add_argument("--timeout", type=int, default=180, help="发送超时秒数")
+    ap.add_argument("--setup-only", action="store_true", help="只配置上下文")
+    ap.add_argument("--status", action="store_true", help="打印当前配置")
+    ap.add_argument("--ls", action="store_true", help="列出模块文件系统内容与剩余空间")
+    ap.add_argument("--clean", action="store_true", help="删除模块内的临时附件文件")
+    ap.add_argument("-q", "--quiet", action="store_true")
+    args = ap.parse_args()
+
+    if not (args.setup_only or args.status or args.ls or args.clean) \
+            and not (args.number and args.image):
+        ap.error("需要 <号码> <图片路径>，或用 --setup-only / --status")
+    if args.image and not os.path.isfile(args.image):
+        ap.error(f"图片不存在: {args.image}")
+
+    mm_rescue_if_needed()        # 上次异常中断的话，先把 MM 救回来
+
+    print("=== 停 ModemManager（AT 口独占）===")
+    mm_stop()
+    time.sleep(2)
+    try:
+        m = Modem(AT_PORT, quiet=args.quiet)
+    except Exception as exc:               # noqa: BLE001
+        mm_start()
+        return print(f"✗ 打不开 {AT_PORT}: {exc}") or 1
+
+    rc = 0
+    try:
+        if args.ls:
+            for cmd in ('AT+QFLST="UFS:*"', 'AT+QFLST="RAM:*"',
+                        'AT+QFLDS="UFS"', 'AT+QFLDS="RAM"'):
+                m.at(cmd, 10)
+            return 0
+
+        if args.clean:
+            for fs in ("UFS", "RAM"):
+                m.at(f'AT+QFDEL="{fs}:mms_out.jpg"', 8)
+            print("✓ 已清理模块内的 mms_out.jpg")
+            return 0
+
+        if args.status:
+            for cmd in ('AT+QMMSCFG="mmsc"', 'AT+QMMSCFG="proxy"', 'AT+QMMSCFG="contextid"',
+                        "AT+QIACT?", 'AT+QFLST="RAM:*"'):
+                m.at(cmd, 8)
+            return 0
+
+        setup(m)
+        if args.setup_only:
+            print("✓ 配置完成（未发送）")
+            return 0
+
+        print("③ 上传附件")
+        args.image = shrink_image(args.image)
+        size = os.path.getsize(args.image)
+        for fs in ("UFS", "RAM"):
+            sp = m.fs_space(fs)
+            if sp:
+                print(f"    {fs}: 已用 {sp[0]} / 共 {sp[1]} 字节"
+                      + ("（够用）" if sp[1] - sp[0] >= size else "（放不下 ✗）"))
+        uploaded = None
+        # 先清掉上次失败可能留下的半截文件，否则 QFUPL 可能报"文件已存在"
+        for fs in ("UFS", "RAM"):
+            m.raw(f'AT+QFDEL="{fs}:mms_out.jpg"', 6)
+        # ackmode=1（文档示例）在部分固件上需要主机配合流控，先试 0
+        # 本固件 ackmode=1 返回 +CME ERROR: 407（不支持），只用 0
+        for fs, ack in (("UFS", 0), ("RAM", 0)):
+            name = f"{fs}:mms_out.jpg"
+            if m.upload(args.image, name, ackmode=ack):
+                uploaded = name
+                break
+            print(f"    ✗ {name} ack={ack} 失败，换下一种组合")
+        if not uploaded:
+            print("  ✗ 所有上传组合都失败")
+            rc = 2
+            raise SystemExit(2)
+        globals()["RAM_FILE"] = uploaded
+        print(f"  ✓ 已上传到 {uploaded}")
+
+        print("④ 填写收件人与附件")
+        m.at(f'AT+QMMSEDIT=1,1,"{args.number}"')
+        if args.subject:
+            m.at('AT+QMMSCFG="character","ASCII"')
+            m.at(f'AT+QMMSEDIT=4,1,"{args.subject}"')
+        m.at(f'AT+QMMSEDIT=5,1,"{RAM_FILE}"')
+        m.at("AT+QMMSEDIT=1", 5)
+        m.at("AT+QMMSEDIT=5", 5)
+
+        print(f"⑤ 发送（最多等 {args.timeout} 秒）")
+        out = m.raw(f"AT+QMMSEND={args.timeout}", args.timeout + 30, wait=r"\+QMMSEND:")
+        match = re.search(r"\+QMMSEND:\s*(-?\d+)\s*,\s*(-?\d+)(?:\s*,\s*(\d+))?", out)
+        print()
+        if match:
+            err, http = int(match.group(1)), int(match.group(2))
+            print(f"  结果: err={err}  HTTP={http}" + (f"  mmsrsp={match.group(3)}" if match.group(3) else ""))
+            if err == 0:
+                print("  ✓ 彩信已提交成功")
+            else:
+                print("  ✗ 发送失败（错误码含义见《MMS 应用指导》第 5 章 / 第 6 章 HTTP 码）")
+                rc = 3
+        else:
+            print("  ✗ 没收到 +QMMSEND 响应：", out.replace("\r", " ").strip()[:300])
+            rc = 3
+
+        print("⑥ 清理：撤销彩信专用 PDP 上下文 + 删临时附件")
+        # ★ 必须撤销！否则 ctwap 上下文一直激活会搅乱 QMI NAS 服务，
+        #   表现为 mmcli state=failed / "Couldn't peek client for service 'nas'"
+        #   → 模块和网络一起掉，必须 AT+CFUN=1,1 复位（见 eg25-unstick）。
+        m.at(f"AT+QIDEACT={MMS_CONTEXT}", 8)
+        m.at(f"AT+CGACT=0,{MMS_CONTEXT}", 5)
+        m.at("AT+QMMSEDIT=0", 10)
+        m.at(f'AT+QFDEL="{RAM_FILE}"', 10)
+    finally:
+        m.close()
+        print("=== 恢复 ModemManager ===")
+        mm_start()
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -91,6 +91,10 @@ Optional, only for the extended features:
 | MMS receive | `mmsd-tng` with a carrier MMSC configuration |
 | SMS archive | an exporter script + an Obsidian vault (auto-detected, silently skipped when absent) |
 
+The helper scripts for these features ship in [`extras/`](extras/) — install
+them with `install -Dm755 extras/* ~/.local/bin/`. Anything not installed is
+detected and skipped without errors; see [`extras/README.md`](extras/README.md).
+
 On a systemd-based distribution, the services can usually be enabled with:
 
 ```sh
@@ -240,8 +244,10 @@ ModemManager connection.
 | `ModemSettings.qml` | Full structured APN profile editor |
 | `StartupCheck.qml` | Dependency checks before activation |
 | `components/ModemTabs.qml` | Traffic / SMS / MMS tabbed pages |
+| `extras/` | Optional helper scripts (MMS send/parse, self-heal, Obsidian archive) |
 | `assets/control-center.png` | Tile icon used for notifications |
 | `docs/NETWORKMANAGER_BACKEND.md` | Detailed backend and UI design |
+| `docs/screenshot.png` | Screenshot shown on the registry site |
 
 For implementation details and command mappings, see
 [NetworkManager backend design](docs/NETWORKMANAGER_BACKEND.md). Plugin

@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""救治被遗留 PDP 上下文搅乱的 EG25-G 模块。
+
+背景：eg25-mms-send 会临时开一个 ctwap 专用 PDP 上下文（cid 2）发彩信。
+若脚本没在结束时撤销它（AT+QIDEACT），QMI 的 NAS 服务会被搅乱，表现为：
+
+    mmcli -m any  →  state: failed
+    ModemManager  →  Couldn't peek client for service 'nas'
+                      Modem in failed state: unknown-capabilities
+
+这时整个模块（以及走它的网络）都会掉。本脚本：
+  ① 停 ModemManager（独占 AT 口）
+  ② AT+QIDEACT=2 / AT+CGACT=0,2  撤销遗留的彩信专用上下文
+  ③ AT+CFUN=1,1                  软复位模块，让 QMI 服务重新干净起来
+  ④ 起 ModemManager 并等它重新识别模块
+用法: eg25-unstick            （需要 systemctl 免密规则）
+"""
+import os
+import re
+import subprocess
+import sys
+import time
+
+ATPORT = "/dev/ttyUSB2"
+MMS_CID = 2
+
+
+def sh(args: list[str]) -> int:
+    return subprocess.run(args, capture_output=True).returncode
+
+
+def mm(action: str) -> None:
+    subprocess.run(["sudo", "-n", "systemctl", action, "ModemManager"],
+                   capture_output=True)
+
+
+def at_session(commands: list[str]) -> None:
+    try:
+        import serial
+    except ImportError:
+        print("  ! 缺 pyserial，跳过 AT 步骤")
+        return
+    try:
+        ser = serial.Serial(ATPORT, 115200, timeout=3)
+    except Exception as exc:                      # noqa: BLE001
+        print(f"  ! 打不开 {ATPORT}: {exc}")
+        return
+    time.sleep(0.4)
+    ser.reset_input_buffer()
+    for cmd, wait in commands:
+        ser.write((cmd + "\r").encode())
+        time.sleep(wait)
+        raw = ser.read(400).decode("utf-8", "replace")
+        first = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        shown = " / ".join(first[:2]) if first else "(无响应)"
+        print(f"    {cmd:<22} → {shown[:70]}")
+    ser.close()
+
+
+def modem_state() -> str:
+    out = subprocess.run(["mmcli", "-m", "any"], capture_output=True, text=True).stdout
+    m = re.search(r"state:\s*(\S+)", out)
+    return m.group(1) if m else "?"
+
+
+def main() -> int:
+    print("=== ① 停 ModemManager（AT 口独占）===")
+    mm("stop")
+    time.sleep(2)
+
+    print("=== ② 撤销遗留的彩信专用 PDP 上下文 ===")
+    at_session([
+        ("AT", 0.5),
+        (f"AT+QIDEACT={MMS_CID}", 3),      # 撤销 ctwap 上下文
+        (f"AT+CGACT=0,{MMS_CID}", 2),      # 双保险
+        ("AT+CGDCONT?", 0.8),
+    ])
+
+    print("=== ③ 软复位模块（重建 QMI 服务）===")
+    at_session([("AT+CFUN=1,1", 3)])
+    print("    等模块重启（15 秒）…")
+    time.sleep(15)
+
+    print("=== ④ 恢复 ModemManager ===")
+    mm("start")
+
+    for i in range(12):
+        time.sleep(5)
+        state = modem_state().strip().lower()
+        if state in ("connected", "registered", "enabled"):
+            print(f"  ✓ 第 {i * 5 + 5} 秒：state = {state}")
+            break
+        print(f"    …{i * 5 + 5}s state={state}")
+    else:
+        state = modem_state()
+        print(f"  ! 60 秒后 state 仍为 {state}")
+
+    print("=== 结果 ===")
+    out = subprocess.run(["mmcli", "-m", "any"], capture_output=True, text=True).stdout
+    for ln in out.splitlines():
+        if re.search(r"state:|signal|operator|access tech|registration", ln, re.I):
+            print("  " + ln.strip())
+    return 0 if state in ("connected", "registered", "enabled") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

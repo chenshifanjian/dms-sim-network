@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Mirror the EG25-G SMS ledger into the Obsidian vault.
+
+Reads the plugin's persisted ledger (written by the DMS Mobile Network plugin)
+and renders one note per peer number under <vault>/短信记录/.
+
+Design notes:
+  * The vault is the permanent archive: notes are never pruned.
+  * One note per peer number, so messages are split by the other party.
+  * Every message is stamped with the SIM it was sent/received on, so traffic
+    from different numbers stays distinguishable.
+  * Notes are regenerated from the ledger on each run (idempotent). A note that
+    does not carry our generated marker is left untouched, so a hand-written
+    file with a colliding name is never clobbered.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import datetime
+
+DEFAULT_STATE = "~/.local/state/DankMaterialShell/plugins/simNetwork_state.json"
+# 插件会显式传 --vault；这里给通用默认，也可用 SIMNETWORK_OBSIDIAN_VAULT 覆盖
+DEFAULT_VAULT = os.environ.get("SIMNETWORK_OBSIDIAN_VAULT", "~/Documents")
+SUBDIR = "短信记录"
+INDEX_NAME = ".sms-index.json"
+MMS_JSON = "~/.local/state/simNetwork/mms.json"
+ATTACH_DIR = "附件"
+MARKER = "<!-- generated-by: hermes-eg25-sms-export -->"
+
+# Well-known Chinese service numbers, used only as a fallback display name.
+KNOWN = {
+    "10000": "中国电信",
+    "10001": "中国电信",
+    "10086": "中国移动",
+    "10010": "中国联通",
+    "10011": "中国联通",
+    "12306": "铁路12306",
+    "95533": "建设银行",
+    "95588": "工商银行",
+    "95566": "中国银行",
+    "95555": "招商银行",
+    "95188": "支付宝",
+    "95516": "银联",
+    "1065": "短信服务号",
+}
+
+
+def parse_ts(value: str) -> datetime | None:
+    """Parse an mmcli stamp or an ISO timestamp, normalised to local time.
+
+    mmcli uses e.g. 2026-09-21T01:11:19+08 (offset without minutes) for
+    received messages, while the ledger's importedAt is UTC with a Z suffix.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+
+    # Offset written without minutes (+08) is not valid ISO; pad it first.
+    m = re.match(r"^(.*T\d{2}:\d{2}:\d{2})([+-])(\d{2})$", text)
+    if m:
+        text = f"{m.group(1)}{m.group(2)}{m.group(3)}00"
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.astimezone() if parsed.tzinfo else parsed
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            parsed = datetime.strptime(text[:19] if fmt == "%Y-%m-%dT%H:%M:%S" else text, fmt)
+            return parsed.astimezone() if parsed.tzinfo else parsed
+        except ValueError:
+            continue
+    return None
+
+
+def effective_ts(message: dict) -> datetime | None:
+    """Outgoing messages often carry no timestamp; fall back to import time."""
+    return parse_ts(message.get("timestamp", "")) or parse_ts(message.get("importedAt", ""))
+
+
+def message_key(m: dict) -> str:
+    """Must match the plugin's smsKey() so the index can re-seed the ledger."""
+    number = re.sub(r"\D", "", str(m.get("number") or ""))
+    return "|".join([
+        number,
+        str(m.get("timestamp") or ""),
+        str(m.get("text") or "")[:60],
+        "out" if m.get("isSubmit") else "in",
+    ])
+
+
+def message_identity(m: dict) -> str:
+    """Content identity, mirroring the plugin's smsIdentity().
+
+    The ledger's key embeds the timestamp, so once a timestamp is corrected
+    (backfilled for old outgoing rows) the same message would otherwise be
+    re-archived under a second key.
+    """
+    number = re.sub(r"\D", "", str(m.get("number") or ""))
+    # 发出去的彩信没有正文，按内容身份会和"同号码的另一张图"撞车 → 用唯一 key。
+    if m.get("kind") == "mms" and m.get("isSubmit"):
+        return str(m.get("key") or "|".join([number, "out", "mms", str(m.get("timestamp") or "")]))
+    return "|".join([number, str(m.get("text") or "")[:200],
+                     "out" if m.get("isSubmit") else "in",
+                     str(m.get("kind") or "sms")])
+
+
+def contact_name(number: str, contacts: dict) -> str:
+    digits = re.sub(r"\D", "", number or "")
+    if digits in contacts:
+        return str(contacts[digits])
+    if digits in KNOWN:
+        return KNOWN[digits]
+    for key, value in KNOWN.items():
+        if digits.startswith(key):
+            return value
+    return ""
+
+
+def safe_name(text: str) -> str:
+    text = re.sub(r"[\\/:*?\"<>|\n\r\t]", "_", text).strip()
+    return text[:80] or "unknown"
+
+
+def sim_label(message: dict, state: dict) -> str:
+    """Identify the SIM that sent/received a message.
+
+    The phone number is the useful part; the operator/ICCID label is kept as a
+    parenthetical so two SIMs on the same operator stay distinguishable.
+    """
+    label = (message.get("simLabel") or "").strip()
+    ident = state.get("simIdentity") or {}
+    if not label:
+        label = (ident.get("label") or "").strip() or "未知设备"
+    number = (ident.get("ownNumber") or "").strip()
+    if number:
+        return f"{number}（{label}）"
+    return label
+
+
+def render(number: str, name: str, messages: list, state: dict) -> str:
+    title = f"{number} · {name}" if name else number
+    lines = [
+        "---",
+        "type: sms-thread",
+        f'peer: "{number}"',
+        f'contact: "{name}"',
+        f"messages: {len(messages)}",
+        f'own_number: "{(state.get("simIdentity") or {}).get("ownNumber") or ""}"',
+        f"updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "auto_generated: true",
+        "tags: [短信]",
+        "---",
+        "",
+        MARKER,
+        f"# {title}",
+        "",
+        "> 由 Hermes 自动维护（来源：EG25-G 4G 模块短信收件箱）。",
+        "> 手动修改会在下次同步时被覆盖；删除本文件不会删除模组上的原始记录。",
+        "",
+    ]
+
+    by_day: dict[str, list] = {}
+    for m in messages:
+        ts = effective_ts(m)
+        day = ts.strftime("%Y-%m-%d") if ts else "未知日期"
+        by_day.setdefault(day, []).append(m)
+
+    for day in sorted(by_day.keys(), reverse=True):
+        lines.append(f"## {day}")
+        lines.append("")
+        entries = sorted(by_day[day], key=lambda x: str(effective_ts(x) or ""), reverse=True)
+        for m in entries:
+            ts = effective_ts(m)
+            clock = ts.strftime("%H:%M") if ts else "--:--"
+            if m.get("kind") == "mms":
+                if m.get("isSubmit"):
+                    lines.append(f"- **{clock} · 发（彩信）** — 收件人 `{number}`"
+                                 f" · 本机 `{sim_label(m, state)}`")
+                else:
+                    who = m.get("from") or number
+                    lines.append(f"- **{clock} · 收（彩信）** — 发件人 `{who}`"
+                                 f" · 本机 `{sim_label(m, state)}`")
+                for a in (m.get("attachments") or []):
+                    lines.append(f"  ![[{a.get('name','')}]]")
+                    lines.append(f"  <sub>{a.get('mime','')} · {a.get('bytes',0)} 字节</sub>")
+                for para in (m.get("text") or "").strip().splitlines():
+                    lines.append(f"  {para}")
+                lines.append("")
+                continue
+            direction = "发" if m.get("isSubmit") else "收"
+            lines.append(f"- **{clock} · {direction}** — 本机 `{sim_label(m, state)}`")
+            body = (m.get("text") or "").strip() or "(空)"
+            for para in body.splitlines():
+                lines.append(f"  {para}")
+            lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--state", default=DEFAULT_STATE, help="plugin state JSON")
+    ap.add_argument("--vault", default=DEFAULT_VAULT, help="Obsidian vault root")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    state_path = os.path.expanduser(args.state)
+    vault = os.path.expanduser(args.vault)
+
+    if not os.path.isfile(state_path):
+        print(f"state file not found: {state_path}", file=sys.stderr)
+        return 1
+    if not os.path.isdir(vault):
+        print(f"vault not found: {vault}", file=sys.stderr)
+        return 1
+
+    with open(state_path, encoding="utf-8") as fh:
+        state = json.load(fh)
+
+    history = state.get("smsHistory") or []
+    if not isinstance(history, list):
+        history = []
+
+    outdir = os.path.join(vault, SUBDIR)
+    os.makedirs(outdir, exist_ok=True)
+
+    contacts_path = os.path.join(outdir, "contacts.json")
+    contacts = {}
+    if os.path.isfile(contacts_path):
+        try:
+            with open(contacts_path, encoding="utf-8") as fh:
+                contacts = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            contacts = {}
+
+    # Tombstones recorded by the plugin's delete/clear actions: those messages
+    # must not be re-offered to the ledger from the archive.
+    deleted_raw = state.get("smsDeletedKeys") or {}
+    deleted = set(deleted_raw.keys()) if isinstance(deleted_raw, dict) else set(deleted_raw)
+
+    index_path = os.path.join(outdir, INDEX_NAME)
+    archived: list = []
+    if os.path.isfile(index_path):
+        try:
+            with open(index_path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, list):
+                # 彩信的唯一真源是 mms.json（号码可能被重新归一化），
+                # 索引里遗留的彩信条目一律丢弃，避免出现重复会话。
+                archived = [m for m in loaded
+                            if message_key(m) not in deleted and m.get("kind") != "mms"]
+        except (OSError, json.JSONDecodeError):
+            archived = []
+
+    # The index is the master record: union it with the live ledger so the
+    # vault outlives the plugin state (which DMS may reset).
+    known = {message_key(m) for m in archived}
+    merged = list(archived)
+    for m in history:
+        k = message_key(m)
+        if k in deleted or k in known:
+            continue
+        known.add(k)
+        merged.append(m)
+
+    # Collapse by content: the live ledger wins over the archived copy.
+    ledger = {}
+    for m in history:
+        ledger.setdefault(message_identity(m), m)
+    collapsed, seen_ids = [], set()
+    for m in merged:
+        ident = message_identity(m)
+        if ident in seen_ids:
+            continue
+        seen_ids.add(ident)
+        collapsed.append(ledger.get(ident, m))
+    merged = collapsed
+
+    # ── 彩信：来自 mms-export 的 JSON，附件拷进 vault 后合并进同一流水线 ──
+    mms_msgs = []
+    mms_path = os.path.expanduser(MMS_JSON)
+    if os.path.isfile(mms_path):
+        try:
+            with open(mms_path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            for mm in (payload.get("messages") or []):
+                if not mm.get("attachments") and not mm.get("text"):
+                    continue
+                att_dir = os.path.join(outdir, ATTACH_DIR)
+                os.makedirs(att_dir, exist_ok=True)
+                atts = []
+                for a in mm.get("attachments") or []:
+                    src, name = a.get("path", ""), a.get("name", "")
+                    if not src or not os.path.isfile(src):
+                        continue
+                    dst = os.path.join(att_dir, name)
+                    if not os.path.isfile(dst) or os.path.getsize(dst) != a.get("bytes"):
+                        shutil.copyfile(src, dst)
+                    atts.append({**a, "name": name, "vaultPath": os.path.join(SUBDIR, ATTACH_DIR, name)})
+                mms_msgs.append({
+                    "key": "mms:" + mm.get("id", ""),
+                    # 用归一化后的 number（去 +86）以便并入同一会话
+                    "number": mm.get("number") or mm.get("from") or "",
+                    "text": mm.get("text") or "",
+                    "timestamp": mm.get("date") or "",
+                    "isSubmit": False,
+                    "kind": "mms",
+                    "from": mm.get("from") or "",
+                    "attachments": atts,
+                    "simLabel": state.get("simLabelOverride") or "",
+                    "source": "mms",
+                })
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"彩信 JSON 读取失败: {exc}", file=sys.stderr)
+
+    # 发出去的彩信由插件 Store 记进历史（附件是本机文件），这里统一拷贝，
+    # 渲染时才能用 ![[...]] 嵌入。对收到的彩信是幂等的（大小一致就不重复拷）。
+    att_dir = os.path.join(outdir, ATTACH_DIR)
+    for m in merged:
+        if m.get("kind") != "mms":
+            continue
+        atts = []
+        for a in m.get("attachments") or []:
+            src = a.get("path", "")
+            name = a.get("name") or (os.path.basename(src) if src else "")
+            if not src or not name or not os.path.isfile(src):
+                atts.append(a)
+                continue
+            os.makedirs(att_dir, exist_ok=True)
+            dst = os.path.join(att_dir, name)
+            if os.path.isfile(dst) and os.path.getsize(dst) != os.path.getsize(src):
+                name = os.path.splitext(name)[0] + "-1" + os.path.splitext(name)[1]
+                dst = os.path.join(att_dir, name)
+            if not os.path.isfile(dst):
+                shutil.copyfile(src, dst)
+            atts.append({**a, "name": name, "bytes": os.path.getsize(dst),
+                         "vaultPath": os.path.join(SUBDIR, ATTACH_DIR, name)})
+        if atts:
+            m["attachments"] = atts
+
+    mms_ids = {message_identity(m) for m in mms_msgs}
+    merged = [m for m in merged if message_identity(m) not in mms_ids]
+    merged.extend(mms_msgs)
+
+    merged.sort(key=lambda m: str(effective_ts(m) or ""), reverse=True)
+
+    # 彩信不进索引：它的唯一真源是 mms.json，写进索引会被插件回读成短信。
+    for_index = [m for m in merged
+                 if m.get("kind") != "mms" and not str(m.get("key", "")).startswith("mms:")]
+    with open(index_path, "w", encoding="utf-8") as fh:
+        json.dump(for_index, fh, ensure_ascii=False, indent=1)
+
+    threads: dict[str, list] = {}
+    for m in merged:
+        number = re.sub(r"\D", "", str(m.get("number") or "")) or "unknown"
+        threads.setdefault(number, []).append(m)
+
+    written = skipped = 0
+    for number, messages in sorted(threads.items()):
+        name = contact_name(number, contacts)
+        filename = safe_name(f"{number} {name}".strip()) + ".md"
+        path = os.path.join(outdir, filename)
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    if MARKER not in fh.read():
+                        print(f"skip (not generated by us): {filename}", file=sys.stderr)
+                        skipped += 1
+                        continue
+            except OSError:
+                pass
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(render(number, name, messages, state))
+        written += 1
+
+    # Keep a snapshot of the module/SIM identity for future reference.
+    ident_path = os.path.join(outdir, "_本机SIM.md")
+    ident = state.get("simIdentity") or {}
+    if ident:
+        with open(ident_path, "w", encoding="utf-8") as fh:
+            fh.write("---\ntype: sim-identity\nauto_generated: true\ntags: [短信]\n---\n\n")
+            fh.write(MARKER + "\n")
+            fh.write("# 本机 SIM 身份\n\n")
+            for key, label in (("label", "标签"), ("operator", "运营商"), ("imsi", "IMSI"),
+                               ("iccid", "ICCID"), ("ownNumber", "本机号码"),
+                               ("netInterface", "数据接口")):
+                if ident.get(key):
+                    fh.write(f"- **{label}**：`{ident[key]}`\n")
+
+    if not args.quiet:
+        print(f"threads={len(threads)} messages={len(merged)} written={written} "
+              f"skipped={skipped} -> {outdir}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
