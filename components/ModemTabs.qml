@@ -296,7 +296,7 @@ ColumnLayout {
                     anchors.centerIn: parent
                     text: {
                         const name = tabs.tabNames[index];
-                        if (index === 2 && tabs.backend && tabs.backend.smsUnreadCount > 0)
+                        if (index === 1 && tabs.backend && tabs.backend.smsUnreadCount > 0)
                             return name + " (" + tabs.backend.smsUnreadCount + ")";
                         return name;
                     }
@@ -313,7 +313,7 @@ ColumnLayout {
                     onClicked: {
                         tabs.activeTab = index;
                         // Opening the inbox clears the badge.
-                        if (index === 2 && tabs.backend) tabs.backend.markSmsHistoryRead();
+                        if (index === 1 && tabs.backend) tabs.backend.markSmsHistoryRead();
                     }
                 }
             }
@@ -422,7 +422,7 @@ ColumnLayout {
             onClicked: if (tabs.backend) tabs.backend.setRadio(!tabs.backend.wwanEnabled)
         }
 
-        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.border }
+        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.outline }
 
         // ── This SIM's own number ─────────────────────────────────────────
         // The modem reports own-numbers as empty for this SIM, so it is typed
@@ -762,7 +762,7 @@ ColumnLayout {
             }
         }
 
-        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.border }
+        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.outline }
 
         // ── Local ledger detail ───────────────────────────────────────────
         GridLayout {
@@ -1071,7 +1071,7 @@ ColumnLayout {
             wrapMode: Text.WordWrap
         }
 
-        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.border }
+        Rectangle { Layout.fillWidth: true; height: 1; color: Theme.outline }
 
         // ── 彩信：用上面那个"对方号码"，选一张图发出去 ──────────────────
         StyledText {
@@ -1147,9 +1147,18 @@ ColumnLayout {
                 text: {
                     if (!tabs.backend) return "";
                     const total = tabs.backend.smsHistory.length;
-                    const shown = tabs.smsFiltered.length;
-                    if (tabs.smsSearch.trim().length > 0 && shown !== total)
-                        return shown + " / " + total;
+                    const q = tabs.smsSearch.trim().toLowerCase();
+                    if (q.length > 0) {
+                        // 直接按搜索词数命中条数，不引用不存在的属性
+                        const hist = tabs.backend.smsHistory;
+                        let shown = 0;
+                        for (let i = 0; i < hist.length; i++) {
+                            const t = String(hist[i].text || "").toLowerCase();
+                            const n = String(hist[i].number || "");
+                            if (t.indexOf(q) !== -1 || n.indexOf(q) !== -1) shown++;
+                        }
+                        if (shown !== total) return shown + " / " + total;
+                    }
                     return total + " kept";
                 }
                 color: Theme.surfaceVariantText
