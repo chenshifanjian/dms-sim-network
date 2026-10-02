@@ -174,9 +174,13 @@ PluginComponent {
         loadModems();
         loadProfiles();
         readDataUsage();
-        if (modems.length > 0) loadSmsList();
-        checkVoiceCapability();
         if (gpsEnabled) refreshLocation();
+    }
+
+    // 只刷流量计数器：5 秒一次也不会给 nmcli/mmcli 添负担。
+    function refreshCounters() {
+        if (refreshing || busy) return;
+        readDataUsage();
     }
 
     function loadRadio() {
@@ -468,20 +472,31 @@ PluginComponent {
         onTriggered: backendStore.seedNotified()
     }
 
-    // 新消息轮询：短信走 mmcli（loadSmsList），彩信走 mms-export。
+    // 新消息轮询：短信走 mmcli（loadSmsList），彩信走 mms-export；
+    // 语音能力也只在这里查（它不会几秒一变）。
     property Timer messagePollTimer: Timer {
         interval: 30000
         repeat: true
         onTriggered: {
             backendStore.loadSmsList();
             backendStore.loadMmsMessages();
+            backendStore.checkVoiceCapability();
         }
     }
 
     Component.onDestruction: backendStore.saveUsageHistory()
 
+    // 流量页要实时跟手，但没必要每 5 秒把 nmcli/mmcli 全跑一遍：
+    // 高频只读 /sys 计数器（2 次 cat），modem/信号/APN 全量刷新降频到 15 秒。
     Timer {
         interval: 5000
+        repeat: true
+        running: true
+        onTriggered: backendStore.refreshCounters()
+    }
+
+    Timer {
+        interval: 15000
         repeat: true
         running: true
         onTriggered: backendStore.refresh()
@@ -1416,7 +1431,8 @@ PluginComponent {
                 } else {
                     let hint = "";
                     if (/not allowed|password|密码/i.test(text))
-                        hint = "（停/启 ModemManager 需要免密：检查 /etc/sudoers.d 里是否放行了 /usr/bin/systemctl）";
+                        hint = "（停/启 ModemManager 需要免密：/etc/sudoers.d 里只放行 systemctl start/stop ModemManager 这两条，"
+                             + "别整条放行 /usr/bin/systemctl）";
                     const trimmed = text.trim();
                     const detail = m ? ("err=" + m[1] + " HTTP=" + m[2])
                                      : (trimmed ? trimmed.split("\n").slice(-3).join(" / ").slice(0, 220)
@@ -1605,7 +1621,7 @@ PluginComponent {
     property var quota: null                  // { used, remaining, month, at, raw, source, lifetimeAtCapture }
     property bool quotaQueryPending: false
     property string quotaStatus: ""
-    property bool quotaAutoQuery: true        // at most one SMS per month
+    property bool quotaAutoQuery: false       // 默认关：自动给运营商号发短信得用户自己点头
     property string quotaQueryNumber: "10001" // China Telecom self-service
     property string quotaQueryText: "108"     // China Telecom data query
     property string lastAutoQueryMonth: ""
@@ -1621,7 +1637,7 @@ PluginComponent {
         try { q = pluginService.loadPluginState(pluginId, "quota", null); }
         catch (e) { q = null; }
         backendStore.quota = q && typeof q === "object" ? q : null;
-        backendStore.quotaAutoQuery = pluginService.loadPluginState(pluginId, "quotaAutoQuery", true);
+        backendStore.quotaAutoQuery = pluginService.loadPluginState(pluginId, "quotaAutoQuery", false);
         backendStore.quotaQueryNumber = pluginService.loadPluginState(pluginId, "quotaQueryNumber", "10001");
         backendStore.quotaQueryText = pluginService.loadPluginState(pluginId, "quotaQueryText", "108");
         backendStore.lastAutoQueryMonth = pluginService.loadPluginState(pluginId, "lastAutoQueryMonth", "");

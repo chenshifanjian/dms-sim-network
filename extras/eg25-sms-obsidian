@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mirror the EG25-G SMS ledger into the Obsidian vault.
 
-Reads the plugin's persisted ledger (written by the DMS Mobile Network plugin)
+Reads the plugin's persisted ledger (written by the SIM Network plugin)
 and renders one note per peer number under <vault>/短信记录/.
 
 Design notes:

@@ -6,8 +6,25 @@ location — on top of the APN profile management.
 
 The plugin uses **NetworkManager as the only connection backend**.
 NetworkManager owns APN profiles, activation, autoconnect, routing, and bearer
-lifecycle. ModemManager is queried read-only to enrich the interface with modem,
-operator, access-technology, registration, and signal information.
+lifecycle. The core pages query ModemManager **read-only** for modem, operator,
+access-technology, registration and signal information.
+
+Where the plugin does touch the modem, it is spelled out:
+
+- **SMS**: sends the messages you compose. It can also send one carrier quota
+  query per month — **off by default**, and only sent after you turn it on in
+  the settings.
+- **MMS with attachments** runs `extras/eg25-mms-send`, which **temporarily
+  stops ModemManager** to own the AT port, writes raw AT commands to the
+  modem's AT port, then starts it again. A watchdog restores the data link if
+  the send gets interrupted.
+- **Location** enables GNSS through ModemManager (`gps-raw` / `gps-nmea`).
+- **Voice calls** exist as code (`mmcli --voice-create-call`) but are **not
+  part of the advertised feature set**: the EG25 firmware this was developed
+  against has voice locked, and it is untested elsewhere.
+
+The optional helpers also issue `AT+CFUN=1,1` (modem reset) from
+`extras/eg25-unstick` when ModemManager is stuck.
 
 ## Features
 
@@ -41,6 +58,27 @@ operator, access-technology, registration, and signal information.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Relationship to Mobile Network
+
+This plugin began as a modification of
+[NaClwww/dms-modem-plugin](https://github.com/NaClwww/dms-modem-plugin) — the
+**Mobile Network** plugin that is already in the registry
+(`naclwww-modem.json`). Its APN profile editor, startup checks, Control Center
+tile structure and the original README come from there.
+
+What SIM Network adds on top:
+
+- SMS in per-number sessions, with search, paging and copy
+- MMS receive (via `mmsd-tng`) and MMS send (modem AT path)
+- desktop notifications for new messages, without re-notifying old ones at boot
+- traffic accounting: today / month / lifetime, live throughput, IP-stack toggle
+- cell + GPS location through GeoClue
+- optional Obsidian archive, and self-healing after a failed MMS send
+
+The two install side by side under different ids (`simNetwork` vs
+`modemManager`), so DMS loads them independently. If you only need the WWAN
+toggle and APN profile management, Mobile Network is the lighter choice.
 
 ## Architecture
 
