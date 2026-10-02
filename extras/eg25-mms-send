@@ -84,7 +84,7 @@ def run(cmd: list[str]) -> str:
         return ""
 
 
-MM_FLAG = "/tmp/eg25-mm-stopped"          # 标记「我们停过 MM」，供兜底与自愈使用
+MM_FLAG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "eg25-mm-stopped")  # 每用户私有：别人往 /tmp 塞标记也触发不了自愈
 # 注意：不能放 /run（root 目录，普通用户写不进去，标记会静默丢失）
 
 

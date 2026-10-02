@@ -21,7 +21,7 @@ import time
 
 # 与本脚本同目录找 eg25-unstick，换用户/换机器都能跑
 HEAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eg25-unstick")
-FLAG = "/tmp/eg25-mm-stopped"
+FLAG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "eg25-mm-stopped")
 
 
 def sh(cmd: list[str], timeout: int = 90) -> tuple[int, str]:

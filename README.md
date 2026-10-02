@@ -47,7 +47,7 @@ The optional helpers also issue `AT+CFUN=1,1` (modem reset) from
 - MMS: receive with image attachments, send an image via modem-native AT commands
 - Desktop notifications for new messages (suppresses re-notify of old ones on boot)
 - Obsidian archive of the SMS ledger (optional, auto-detected)
-- Cell-tower (3GPP) and GPS location surfaced through GeoClue
+- GPS location read from the modem (`mmcli --location-get`)
 - Self-healing when an MMS send is interrupted: the watchdog restores
   ModemManager so the data connection comes back on its own
 
@@ -73,7 +73,7 @@ What SIM Network adds on top:
 - MMS receive (via `mmsd-tng`) and MMS send (modem AT path)
 - desktop notifications for new messages, without re-notifying old ones at boot
 - traffic accounting: today / month / lifetime, live throughput, IP-stack toggle
-- cell + GPS location through GeoClue
+- GPS location read from the modem (`mmcli --location-get`)
 - optional Obsidian archive, and self-healing after a failed MMS send
 
 The two install side by side under different ids (`simNetwork` vs

@@ -24,6 +24,26 @@ install -Dm755 extras/* ~/.local/bin/
 | `eg25-sms-obsidian` | Obsidian archive | Copies SMS/MMS into an Obsidian vault. `--vault` defaults to `~/Documents`; the plugin passes its own setting. |
 | `dns-probe` | Troubleshooting | Quick DNS reachability probe over the cellular link. |
 
+## Sudoers
+
+`eg25-mms-send` stops and starts ModemManager around the AT transfer, and does it
+without a password prompt. The narrow rule — put it in `/etc/sudoers.d/modemmanager-mms`
+and check it with `visudo -cf /etc/sudoers.d/modemmanager-mms`:
+
+```
+youruser ALL=(root) NOPASSWD: /usr/bin/systemctl start ModemManager, /usr/bin/systemctl stop ModemManager
+```
+
+Replace `youruser` with your login. **Do not** grant `/usr/bin/systemctl`
+itself: that is effectively passwordless root.
+
+## Flag file
+
+The scripts record "we stopped ModemManager" in
+`$XDG_RUNTIME_DIR/eg25-mm-stopped` (per-user, mode-protected directory), never
+in `/tmp`, so another local user cannot plant the flag and make the watchdog
+reset your modem.
+
 ## Carrier assumptions
 
 `eg25-mms-send` and `mms-export` encode the China Telecom APN layout

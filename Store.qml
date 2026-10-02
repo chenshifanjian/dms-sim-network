@@ -835,7 +835,7 @@ PluginComponent {
     // provisioned), so the number is settable by hand and remembered.
     property string simOwnNumberOverride: ""
     property string smsExportStatus: ""
-    property bool smsExportEnabled: true
+    property bool smsExportEnabled: false
     // ── MMS (彩信) ───────────────────────────────────────────────────
     // mmsd-tng 把彩信以原始 PDU 落盘；mms-export 解析成 JSON，插件只读这个 JSON。
     property var mmsMessages: []
@@ -888,7 +888,7 @@ PluginComponent {
         if (!pluginService || !pluginId) return;
         backendStore.simLabelOverride = pluginService.loadPluginState(pluginId, "simLabelOverride", "");
         backendStore.simOwnNumberOverride = pluginService.loadPluginState(pluginId, "simOwnNumberOverride", "");
-        backendStore.smsExportEnabled = pluginService.loadPluginState(pluginId, "smsExportEnabled", true);
+        backendStore.smsExportEnabled = pluginService.loadPluginState(pluginId, "smsExportEnabled", false);
         backendStore.notifyEnabled = pluginService.loadPluginState(pluginId, "notifyEnabled", true);
         backendStore.obsidianExporter = pluginService.loadPluginState(pluginId, "obsidianExporter",
             backendStore.obsidianExporter);
@@ -1100,12 +1100,12 @@ PluginComponent {
         running: true
         triggeredOnStart: true
         onTriggered: {
-            // 只有在上次运行留下标记（/tmp/eg25-mm-stopped）时才检查，避免多余调用
+            // 只有在上次运行留下标记（$XDG_RUNTIME_DIR/eg25-mm-stopped）时才检查，避免多余调用
             Proc.runCommand(backendStore.commandPrefix + ".mmwatch",
                 ["sh", "-c",
                  // 只在「持有标记的进程已经不在了」或「标记超过 10 分钟」时才动手，
                  // 否则会把正在进行的 AT 发送打断。
-                 "f=/tmp/eg25-mm-stopped; [ -f \"$f\" ] || exit 0; "
+                 "f=${XDG_RUNTIME_DIR:-/tmp}/eg25-mm-stopped; [ -f \"$f\" ] || exit 0; "
                  + "pid=$(cut -d: -f1 \"$f\"); ts=$(cut -d: -f2 \"$f\"); now=$(date +%s); "
                  + "kill -0 \"$pid\" 2>/dev/null && [ $((now - ${ts:-0})) -lt 600 ] && exit 0; "
                  + "rm -f \"$f\"; "
@@ -1427,7 +1427,7 @@ PluginComponent {
                     backendStore.mmsSendStatus = "✓ 彩信已发出（HTTP " + m[2] + "）";
                     backendStore.recordSentMms(String(number), String(image));
                     if (done) done(true, "sent");
-                    backendStore.smsReloadTimer.restart();
+                    smsReloadTimer.restart();
                 } else {
                     let hint = "";
                     if (/not allowed|password|密码/i.test(text))
@@ -1442,9 +1442,9 @@ PluginComponent {
                     backendStore.mmsSendStatus = "✗ 发送失败：" + detail + " " + hint;
                     if (done) done(false, detail);
                     // 失败常常是因为脚本中途被杀 → 停掉的 ModemManager 没起回来
-                    backendStore.mmHealTimer.restart();
+                    mmHealTimer.restart();
                 }
-                if (code === 0 && m && m[1] === "0") backendStore.mmHealTimer.restart();
+                if (code === 0 && m && m[1] === "0") mmHealTimer.restart();
             });
     }
 
@@ -1897,7 +1897,7 @@ PluginComponent {
                     backendStore.smsStatusMessage = "SMS sent";
                     backendStore.recordSentSms(number, text);
                     if (done) done(true, "SMS sent");
-                    backendStore.smsReloadTimer.restart();
+                    smsReloadTimer.restart();
                 } else {
                     backendStore.smsStatusMessage = "Send failed: " + sendOut.trim();
                     if (done) done(false, sendOut.trim());
