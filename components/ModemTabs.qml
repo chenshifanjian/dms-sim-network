@@ -12,7 +12,7 @@ ColumnLayout {
     // Key of the SMS row whose text was just copied (drives the ✓ feedback).
     property string copiedKey: ""
 
-    // ── 可见性登记（review R1）─────────────────────────────────────
+    // ── 可见性登记 ──────────────────────────────────────────────
     // 本组件只在 popout / 控制中心详情展开时才被实例化，所以它的生死就是
     // 「面板是否可见」的天然信号：打开时 backend.uiUsers++，关掉时 --。
     // Store 据此把重量级刷新从「永远 15 秒」改成「开着 15 秒 / 关着 60 秒」。
@@ -209,8 +209,8 @@ ColumnLayout {
 
     // Local UI state (shared by every host instance)
     property int activeTab: 0
-    // 通话页下线：EG25-G 固件锁死 VoLTE，README 也不承诺通话功能
-    //（review 第 7 轮：tab 里还挂着拨号/接听/挂断，与文档矛盾）。
+    // 通话页下线：EG25-G 固件锁死 VoLTE，README 也不承诺通话功能，
+    // 而标签里还挂着拨号/接听/挂断，自相矛盾。
     readonly property var tabNames: ["网络", "短信", "定位"]
     property string smsRecipient: ""
     property string smsText: ""

@@ -15,11 +15,11 @@ PluginComponent {
     readonly property string helperDir: Quickshell.env("SIMNETWORK_HELPER_DIR") || (homeDir + "/.local/bin")
     readonly property string stateDir: Quickshell.env("SIMNETWORK_STATE_DIR") || (homeDir + "/.local/state/simNetwork")
 
-    // ── R1（进程风暴）三个开关 ─────────────────────────────────────
+    // ── 后台开销的三个开关 ─────────────────────────────────────────
     // hasModem           没有猫就整套停手，USB 拔了不再空转
     // uiVisible          只有 popout / 控制中心详情真的开着才做重量级刷新
     // heal/mmsExporter…  extras 没装就不跑看门狗和 mms-export，否则每次都是一个
-    //                    必然失败的子进程（review 明确要求"仅在已安装时运行"）
+    //                    必然失败的子进程（没装就别跑）
     readonly property bool hasModem: modems.length > 0
     property int uiUsers: 0
     readonly property bool uiVisible: uiUsers > 0
@@ -27,7 +27,7 @@ PluginComponent {
     property bool mmsExporterInstalled: false
 
     // 面板/设置页真的打开了才算一次"用户动作"——IP 模式改在这一刻读，
-    // 平时不轮询（review 第 6 轮：该值只可能由 setIpMode 或外部改动引起）。
+    // 平时不轮询：该值只可能由 setIpMode 或外部改动引起。
     function acquireUi() {
         uiUsers = uiUsers + 1;
         refreshIpMode();                 // IP 模式：用户动作才读
@@ -214,7 +214,7 @@ PluginComponent {
             loadProfiles();
         } else {
             // 面板关着时 APN 列表和 WWAN 开关状态没人看：这两样
-            // （2 个 nmcli）改到打开面板那一刻才查（review 第 6 轮）。
+            //（2 个 nmcli）改到打开面板那一刻才查。
             finishPart("profiles");
         }
     }
@@ -797,7 +797,7 @@ PluginComponent {
         });
     }
 
-    // FileView 直读 /sys 计数器（review R1：原先每 5 秒派 2 个 cat，
+    // FileView 直读 /sys 计数器（原先每 5 秒派 2 个 cat，
     // 一分钟 24 个进程）。两个文件都读到才结算，否则速率会一格有一格没有。
     FileView {
         id: counterRxFile
@@ -1529,7 +1529,7 @@ PluginComponent {
                     mmHealTimer.restart();
                 }
                 // 成功路径不再排自愈：脚本自己会把 ModemManager 起回来，
-                // 这里再调一次只会平白重启服务（review R2）。
+                // 这里再调一次只会平白重启服务。
             });
     }
 
@@ -1882,7 +1882,7 @@ PluginComponent {
         return modems[0].id;
     }
 
-    // path -> 已解析的短信。review R1：原先每 30 秒给每条存量短信各起一个
+    // path -> 已解析的短信。原先每 30 秒给每条存量短信各起一个
     // mmcli（23 条 = 23 个进程一轮），现在终态的短信直接用缓存，只查新的
     // 和还在发送中的。
     property var smsDetailCache: ({})
