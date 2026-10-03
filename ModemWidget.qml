@@ -178,7 +178,7 @@ PluginComponent {
             // NOTE: PopoutComponent has no popoutHeight — that lives on the
             // plugin root, and reading it off the component yields undefined
             // (NaN height => the popout renders nothing).
-            Flickable {
+            DankFlickable {
                 width: parent.width
                 height: Math.max(200, (root.popoutHeight || 640)
                                  - barPopout.headerHeight - barPopout.detailsHeight)
@@ -222,7 +222,7 @@ PluginComponent {
             radius: Theme.cornerRadius
             color: Theme.surfaceContainerHigh
 
-            Flickable {
+            DankFlickable {
                 id: ccScroll
                 anchors.fill: parent
                 anchors.margins: Theme.spacingM

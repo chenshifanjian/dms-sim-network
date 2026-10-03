@@ -26,7 +26,13 @@ PluginComponent {
     property bool healHelperInstalled: false
     property bool mmsExporterInstalled: false
 
-    function acquireUi() { uiUsers = uiUsers + 1 }
+    // 面板/设置页真的打开了才算一次"用户动作"——IP 模式改在这一刻读，
+    // 平时不轮询（review 第 6 轮：该值只可能由 setIpMode 或外部改动引起）。
+    function acquireUi() {
+        uiUsers = uiUsers + 1;
+        refreshIpMode();                 // IP 模式：用户动作才读
+        if (!refreshing && !busy) refresh();   // 打开面板即把 APN 列表/WWAN 开关补上
+    }
     function releaseUi() { uiUsers = Math.max(0, uiUsers - 1) }
 
     FileView {
@@ -200,11 +206,17 @@ PluginComponent {
         if (refreshing || busy) return;
         refreshing = true;
         errorMessage = "";
-        loadRadio();
-        loadModems();
-        loadProfiles();
         readDataUsage();
         if (gpsEnabled) refreshLocation();
+        loadModems();
+        if (uiVisible) {
+            loadRadio();
+            loadProfiles();
+        } else {
+            // 面板关着时 APN 列表和 WWAN 开关状态没人看：这两样
+            // （2 个 nmcli）改到打开面板那一刻才查（review 第 6 轮）。
+            finishPart("profiles");
+        }
     }
 
     // 只刷流量计数器：5 秒一次也不会给 nmcli/mmcli 添负担。
@@ -296,7 +308,8 @@ PluginComponent {
                                 signal: Number(quality.value || 0),
                                 access: Array.isArray(access) ? access.join(", ") : clean(access),
                                 mmBearerPath: clean(generic["bearers"] && generic["bearers"][0] ? generic["bearers"][0] : ""),
-                                hasVoice: Array.isArray(access) && (access.includes("lte") || access.includes("umts") || access.includes("gsm"))
+                                hasVoice: Array.isArray(access) && (access.includes("lte") || access.includes("umts") || access.includes("gsm")),
+                                hasAccess: Array.isArray(access) && access.length > 0
                             });
                         } catch (error) { console.warn("[SimNetwork] invalid modem JSON", id); }
                     }
@@ -512,7 +525,6 @@ PluginComponent {
             backendStore.loadSmsList();
             // mms-export 是 Python 进程，装了才跑；没装就别每分钟白起一次
             if (backendStore.mmsExporterInstalled) backendStore.loadMmsMessages();
-            backendStore.checkVoiceCapability();
         }
     }
 
@@ -536,16 +548,16 @@ PluginComponent {
         onTriggered: backendStore.refresh()
     }
 
-    // The carrier reassigns the address on every reconnect, so re-read it.
+    // The carrier reassigns the address on every reconnect, so re-read it —
+    // but only while the traffic page can actually be seen. IP mode is not
+    // polled at all: it only changes through setIpMode (and on first open),
+    // so a 60 s nmcli poll was pure overhead.
     Timer {
-        interval: backendStore.uiVisible ? 20000 : 60000
+        interval: 20000
         repeat: true
-        running: backendStore.hasModem
+        running: backendStore.hasModem && backendStore.uiVisible
         triggeredOnStart: true
-        onTriggered: {
-            backendStore.refreshWanAddresses();
-            backendStore.refreshIpMode();
-        }
+        onTriggered: backendStore.refreshWanAddresses();
     }
 
     // Flush the usage ledger and check the monthly carrier quota.
@@ -2028,23 +2040,6 @@ PluginComponent {
     // ═════════════════════════════════════════════════════════════════════
     // VOICE CALLS via mmcli
     // ═════════════════════════════════════════════════════════════════════
-
-    function checkVoiceCapability() {
-        const id = getModemId();
-        if (!id) { voiceAvailable = false; return; }
-        Proc.runCommand(commandPrefix + ".voice.check", ["mmcli", "--modem", id, "--output-json"], (output, code) => {
-            if (code !== 0) { backendStore.voiceAvailable = false; return; }
-            try {
-                if (!output) throw new Error("empty response");
-                const data = JSON.parse(output).modem || {};
-                const generic = data.generic || {};
-                const access = generic["access-technologies"] || [];
-                backendStore.voiceAvailable = Array.isArray(access) && access.length > 0;
-            } catch (e) {
-                backendStore.voiceAvailable = false;
-            }
-        });
-    }
 
     function dialCall(number) {
         if (!number) return;
