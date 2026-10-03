@@ -1,3 +1,14 @@
+SIM Network — licensing
+=======================
+
+This repository holds two kinds of code, with different rights.
+
+1. Original work — MIT
+----------------------
+Everything written for this project (the SMS / MMS / history / traffic /
+GPS features, the extras/ helper scripts, and the original parts of
+Store.qml and of the QML components) is licensed under the MIT License:
+
 MIT License
 
 Copyright (c) 2026 chenshifanjian
@@ -19,3 +30,36 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+2. Upstream-derived files — NOT covered by the MIT grant above
+--------------------------------------------------------------
+This project derives from NaClwww's "Mobile Network" DMS plugin:
+    https://github.com/NaClwww/dms-modem-plugin
+That upstream ships no LICENSE file, which by default means all rights are
+reserved by its author. The following files contain substantial portions
+derived from it, and are therefore excluded from the MIT grant in section 1:
+
+    docs/NETWORKMANAGER_BACKEND.md    predominantly upstream text
+    StartupCheck.qml                  predominantly upstream code
+    ModemSettings.qml                 predominantly upstream code
+    ModemWidget.qml                   predominantly upstream code
+    plugin.json                      upstream structure with edits
+    README.md                         upstream sections with edits
+    assets/control-center.png         upstream asset, unchanged
+    Store.qml                         upstream core with large additions
+
+No licence is claimed over those files in this repository, and this file does
+not relicense them. They remain under whatever terms their upstream author
+has set (currently: no license at all).
+
+Permission to keep redistributing them is being requested from the upstream
+author via NaClwww/dms-modem-plugin#2 and by e-mail (both opened 2026-10-02).
+Until that permission exists:
+
+  * registry maintainers should treat those files as unlicensed, and may
+    reject this entry or request its removal at any time;
+  * the MIT statement above applies only to section 1 of this file.
+
+If the upstream author grants a licence, this file will be updated to name
+it, and the scope of the MIT grant will be restated accordingly.

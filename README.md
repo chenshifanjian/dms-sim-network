@@ -57,7 +57,10 @@ The optional helpers also issue `AT+CFUN=1,1` (modem reset) from
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Original work is MIT — see [LICENSE](LICENSE). Files derived from NaClwww's
+Mobile Network plugin are **excluded** from that grant: the upstream ships no
+licence, and permission is still being requested
+([NaClwww/dms-modem-plugin#2](https://github.com/NaClwww/dms-modem-plugin/issues/2)).
 
 ## Relationship to Mobile Network
 
@@ -118,6 +121,8 @@ or changes modem/SIM configuration through ModemManager.
 - ModemManager and its running system service
 - `nmcli`
 - `mmcli`
+- `ip` (WAN address shown on the traffic page)
+- `curl` (the on-demand public-IP lookup, see below)
 - A modem supported by ModemManager
 
 Optional, only for the extended features:
@@ -125,6 +130,10 @@ Optional, only for the extended features:
 Notifications and clipboard copy use the **DMS built-ins** (`dms notify`,
 `dms clipboard copy`) instead of `notify-send` / `wl-copy`, so neither is a
 dependency.
+
+**Third-party network call:** clicking the public-IP lookup runs
+`curl https://api64.ipify.org` once, bound to the modem interface. That is
+the only outbound request the plugin makes; it never runs on its own.
 
 | Feature | Needs |
 | --- | --- |
