@@ -34,7 +34,26 @@ try:
 except ImportError:
     sys.exit("需要 pyserial：python3 -m pip install pyserial")
 
-AT_PORT = os.environ.get("EG25_AT_PORT", "/dev/ttyUSB2")
+def detect_at_port() -> str:
+    """AT 口向 ModemManager 查询（mmcli 报 ttyUSB2 (at)），不写死 /dev/ttyUSB2：
+    换机型 / 换 USB 口 / 根序号变化都会让 ttyUSB 编号变，写死会静默打不开口。"""
+    env = os.environ.get("EG25_AT_PORT")
+    if env:
+        return env
+    try:
+        out = subprocess.run(["mmcli", "-m", "any", "--output-keyvalue"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except Exception:                                  # noqa: BLE001
+        out = ""
+    for line in out.splitlines():
+        # modem.generic.ports.value[4]   : ttyUSB2 (at)
+        if line.endswith("(at)"):
+            dev = line.rsplit(":", 1)[-1].strip().split()[0]
+            return dev if dev.startswith("/") else "/dev/" + dev
+    return "/dev/ttyUSB2"                              # 最后兜底
+
+
+AT_PORT = detect_at_port()
 # 用独立 PDP 上下文。cid 1 已被 ModemManager 的 ctnet 占用，5 是 IMS，
 # 所以取空闲的 2，避免和上网连接互相踢掉。
 MMS_CONTEXT = int(os.environ.get("EG25_MMS_CONTEXT", "2"))

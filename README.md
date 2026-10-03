@@ -122,12 +122,16 @@ or changes modem/SIM configuration through ModemManager.
 
 Optional, only for the extended features:
 
+Notifications and clipboard copy use the **DMS built-ins** (`dms notify`,
+`dms clipboard copy`) instead of `notify-send` / `wl-copy`, so neither is a
+dependency.
+
 | Feature | Needs |
 | --- | --- |
-| Desktop notifications | `notify-send` (libnotify) |
-| MMS send | `zenity`, ImageMagick (`convert`), and the `eg25-mms-send` helper |
+| MMS send | `pyserial` (`python3 -m pip install pyserial`), `zenity`, ImageMagick (`convert`), the `eg25-mms-send` helper, and one NOPASSWD sudoers rule limited to `systemctl start/stop ModemManager` (see [`extras/README.md`](extras/README.md)) |
 | MMS receive | `mmsd-tng` with a carrier MMSC configuration |
 | SMS archive | an exporter script + an Obsidian vault (auto-detected, silently skipped when absent) |
+| Modem hard reset (`eg25-unstick --reset`) | manual only — never invoked automatically |
 
 The helper scripts for these features ship in [`extras/`](extras/) — install
 them with `install -Dm755 extras/* ~/.local/bin/`. Anything not installed is

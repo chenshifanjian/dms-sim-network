@@ -12,6 +12,13 @@ ColumnLayout {
     // Key of the SMS row whose text was just copied (drives the ✓ feedback).
     property string copiedKey: ""
 
+    // ── 可见性登记（review R1）─────────────────────────────────────
+    // 本组件只在 popout / 控制中心详情展开时才被实例化，所以它的生死就是
+    // 「面板是否可见」的天然信号：打开时 backend.uiUsers++，关掉时 --。
+    // Store 据此把重量级刷新从「永远 15 秒」改成「开着 15 秒 / 关着 60 秒」。
+    Component.onCompleted: if (tabs.backend) tabs.backend.acquireUi()
+    Component.onDestruction: if (tabs.backend) tabs.backend.releaseUi()
+
     // Inline editor for the SIM's own number (the modem reports it as empty).
     property bool editingOwnNumber: false
 

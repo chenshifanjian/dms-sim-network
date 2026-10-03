@@ -13,7 +13,11 @@
   ② AT+QIDEACT=2 / AT+CGACT=0,2  撤销遗留的彩信专用上下文
   ③ AT+CFUN=1,1                  软复位模块，让 QMI 服务重新干净起来
   ④ 起 ModemManager 并等它重新识别模块
-用法: eg25-unstick            （需要 systemctl 免密规则）
+用法: eg25-unstick            软恢复：停 MM → 撤残留 PDP → 起 MM，不碰模块
+      eg25-unstick --reset    额外发 AT+CFUN=1,1 软复位（会断网约 20 秒）
+                              **只允许人手动敲**：插件的看门狗/失败自愈一律
+                              不带这个参数，避免无人值守时把猫重启掉
+需要 systemctl 免密规则；AT 口问 ModemManager 要（可用 EG25_AT_PORT 覆盖）。
 """
 import os
 import re
@@ -21,8 +25,26 @@ import subprocess
 import sys
 import time
 
-ATPORT = "/dev/ttyUSB2"
 MMS_CID = 2
+
+
+def at_port() -> str:
+    """AT 口向 ModemManager 查询，不写死 /dev/ttyUSB2：
+    换机型、换 USB 口、换根序号都会让 ttyUSB 编号变。"""
+    env = os.environ.get("EG25_AT_PORT")
+    if env:
+        return env
+    try:
+        out = subprocess.run(["mmcli", "-m", "any", "--output-keyvalue"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except Exception:                                  # noqa: BLE001
+        out = ""
+    for line in out.splitlines():
+        # modem.generic.ports.value[4]   : ttyUSB2 (at)
+        if line.endswith("(at)"):
+            dev = line.rsplit(":", 1)[-1].strip().split()[0]
+            return dev if dev.startswith("/") else "/dev/" + dev
+    return "/dev/ttyUSB2"                             # 最后兜底
 
 
 def sh(args: list[str]) -> int:
@@ -40,10 +62,11 @@ def at_session(commands: list[str]) -> None:
     except ImportError:
         print("  ! 缺 pyserial，跳过 AT 步骤")
         return
+    port = at_port()
     try:
-        ser = serial.Serial(ATPORT, 115200, timeout=3)
+        ser = serial.Serial(port, 115200, timeout=3)
     except Exception as exc:                      # noqa: BLE001
-        print(f"  ! 打不开 {ATPORT}: {exc}")
+        print(f"  ! 打不开 {port}: {exc}")
         return
     time.sleep(0.4)
     ser.reset_input_buffer()
@@ -63,7 +86,7 @@ def modem_state() -> str:
     return m.group(1) if m else "?"
 
 
-def main() -> int:
+def main(do_reset: bool = False) -> int:
     print("=== ① 停 ModemManager（AT 口独占）===")
     mm("stop")
     time.sleep(2)
@@ -76,10 +99,14 @@ def main() -> int:
         ("AT+CGDCONT?", 0.8),
     ])
 
-    print("=== ③ 软复位模块（重建 QMI 服务）===")
-    at_session([("AT+CFUN=1,1", 3)])
-    print("    等模块重启（15 秒）…")
-    time.sleep(15)
+    if do_reset:
+        print("=== ③ 软复位模块（AT+CFUN=1,1，--reset 显式指定）===")
+        at_session([("AT+CFUN=1,1", 3)])
+        print("    等模块重启（15 秒）…")
+        time.sleep(15)
+    else:
+        print("=== ③ 跳过 AT+CFUN=1,1（默认不动模块）===")
+        print("    没恢复？手动执行：eg25-unstick --reset   （会断网约 20 秒）")
 
     print("=== ④ 恢复 ModemManager ===")
     mm("start")
@@ -104,4 +131,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    argv = [a for a in sys.argv[1:] if a]
+    unknown = [a for a in argv if a not in ("--reset", "-r")]
+    if unknown:
+        sys.exit(f"未知参数 {unknown}；可用：--reset（软复位模块）")
+    sys.exit(main(do_reset="--reset" in argv or "-r" in argv))

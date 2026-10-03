@@ -74,7 +74,8 @@ def main() -> int:
         return 0
 
     # ④ 坏状态（failed / unknown / disabled）→ 清残留上下文
-    print(f"  ③ 状态异常（{state or '未知'}）→ 跑 eg25-unstick 清残留 PDP 上下文")
+    print(f"  ③ 状态异常（{state or '未知'}）→ 跑 eg25-unstick 清残留 PDP 上下文"
+          "（不带 --reset，自动路径不软复位模块）")
     rc, out = sh(["/usr/bin/env", "python3", HEAL], timeout=180)
     tail = "\n".join(out.strip().splitlines()[-6:])
     print("     " + tail.replace("\n", "\n     "))
@@ -86,7 +87,9 @@ def main() -> int:
         _clear_flag()
         return 0
 
-    print("  ✗ 仍异常，建议手动检查（mmcli -m any / journalctl -u ModemManager）")
+    print("  ✗ 仍异常。下一步（要人来点头）：")
+    print("      eg25-unstick --reset    # 软复位模块 AT+CFUN=1,1，会断网约 20 秒")
+    print("      mmcli -m any / journalctl -u ModemManager    # 先看日志")
     return 1
 
 

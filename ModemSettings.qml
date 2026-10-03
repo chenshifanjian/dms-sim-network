@@ -80,7 +80,10 @@ PluginSettings {
 
     Component.onCompleted: {
         selectedModemId = loadValue("selectedModemId", "");
+        if (backend) backend.acquireUi();   // 设置页也算"可见"
     }
+
+    Component.onDestruction: if (backend) backend.releaseUi()
 
     Connections {
         target: backend

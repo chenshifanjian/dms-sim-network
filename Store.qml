@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import qs.Common
 import qs.Modules.Plugins
 
@@ -13,6 +14,35 @@ PluginComponent {
     readonly property string homeDir: Quickshell.env("HOME") || "/home"
     readonly property string helperDir: Quickshell.env("SIMNETWORK_HELPER_DIR") || (homeDir + "/.local/bin")
     readonly property string stateDir: Quickshell.env("SIMNETWORK_STATE_DIR") || (homeDir + "/.local/state/simNetwork")
+
+    // ── R1（进程风暴）三个开关 ─────────────────────────────────────
+    // hasModem           没有猫就整套停手，USB 拔了不再空转
+    // uiVisible          只有 popout / 控制中心详情真的开着才做重量级刷新
+    // heal/mmsExporter…  extras 没装就不跑看门狗和 mms-export，否则每次都是一个
+    //                    必然失败的子进程（review 明确要求"仅在已安装时运行"）
+    readonly property bool hasModem: modems.length > 0
+    property int uiUsers: 0
+    readonly property bool uiVisible: uiUsers > 0
+    property bool healHelperInstalled: false
+    property bool mmsExporterInstalled: false
+
+    function acquireUi() { uiUsers = uiUsers + 1 }
+    function releaseUi() { uiUsers = Math.max(0, uiUsers - 1) }
+
+    FileView {
+        id: healHelperProbe
+        path: backendStore.helperDir + "/eg25-mm-heal"
+        printErrors: false
+        onLoaded: backendStore.healHelperInstalled = true
+        onLoadFailed: backendStore.healHelperInstalled = false
+    }
+    FileView {
+        id: mmsExporterProbe
+        path: backendStore.helperDir + "/mms-export"
+        printErrors: false
+        onLoaded: backendStore.mmsExporterInstalled = true
+        onLoadFailed: backendStore.mmsExporterInstalled = false
+    }
 
     property string commandPrefix: "simNetwork"
     property var modems: []
@@ -475,38 +505,42 @@ PluginComponent {
     // 新消息轮询：短信走 mmcli（loadSmsList），彩信走 mms-export；
     // 语音能力也只在这里查（它不会几秒一变）。
     property Timer messagePollTimer: Timer {
-        interval: 30000
+        interval: backendStore.uiVisible ? 30000 : 60000
         repeat: true
         onTriggered: {
+            if (!backendStore.hasModem) return;
             backendStore.loadSmsList();
-            backendStore.loadMmsMessages();
+            // mms-export 是 Python 进程，装了才跑；没装就别每分钟白起一次
+            if (backendStore.mmsExporterInstalled) backendStore.loadMmsMessages();
             backendStore.checkVoiceCapability();
         }
     }
 
     Component.onDestruction: backendStore.saveUsageHistory()
 
-    // 流量页要实时跟手，但没必要每 5 秒把 nmcli/mmcli 全跑一遍：
-    // 高频只读 /sys 计数器（2 次 cat），modem/信号/APN 全量刷新降频到 15 秒。
+    // 流量计数走 FileView 直读 /sys（0 个子进程），有猫才跑。
     Timer {
-        interval: 5000
+        id: counterTimer
+        interval: 8000
         repeat: true
-        running: true
+        running: backendStore.hasModem
         onTriggered: backendStore.refreshCounters()
     }
 
+    // 全量刷新是重量级的（每个 profile、每个 modem 各起一个 nmcli/mmcli）：
+    // 面板开着才 15 秒一刷，关掉降到 60 秒，只够顶栏小组件显示信号/运营商。
     Timer {
-        interval: 15000
+        interval: backendStore.uiVisible ? 15000 : 60000
         repeat: true
-        running: true
+        running: backendStore.hasModem
         onTriggered: backendStore.refresh()
     }
 
     // The carrier reassigns the address on every reconnect, so re-read it.
     Timer {
-        interval: 20000
+        interval: backendStore.uiVisible ? 20000 : 60000
         repeat: true
-        running: true
+        running: backendStore.hasModem
         triggeredOnStart: true
         onTriggered: {
             backendStore.refreshWanAddresses();
@@ -751,18 +785,46 @@ PluginComponent {
         });
     }
 
+    // FileView 直读 /sys 计数器（review R1：原先每 5 秒派 2 个 cat，
+    // 一分钟 24 个进程）。两个文件都读到才结算，否则速率会一格有一格没有。
+    FileView {
+        id: counterRxFile
+        path: "/sys/class/net/" + backendStore.statsInterface + "/statistics/rx_bytes"
+        printErrors: false
+        onLoaded: { backendStore._rxFresh = true; backendStore.adoptCounters(); }
+        onLoadFailed: backendStore.dataUsageAvailable = false
+    }
+    FileView {
+        id: counterTxFile
+        path: "/sys/class/net/" + backendStore.statsInterface + "/statistics/tx_bytes"
+        printErrors: false
+        onLoaded: { backendStore._txFresh = true; backendStore.adoptCounters(); }
+        onLoadFailed: backendStore.dataUsageAvailable = false
+    }
+
     function readDataUsage() {
         if (modems.length > 0 && modems[0].netInterface && modems[0].netInterface !== statsInterface)
             statsInterface = modems[0].netInterface;
-        const base = "/sys/class/net/" + statsInterface + "/statistics/";
-        Proc.runCommand(commandPrefix + ".data.rx", ["cat", base + "rx_bytes"], (rxOut, rxCode) => {
-            Proc.runCommand(commandPrefix + ".data.tx", ["cat", base + "tx_bytes"], (txOut, txCode) => {
-                if (rxCode !== 0 || txCode !== 0) {
-                    backendStore.dataUsageAvailable = false;
-                    return;
-                }
-                const newRx = parseInt(rxOut.trim(), 10) || 0;
-                const newTx = parseInt(txOut.trim(), 10) || 0;
+        if (!hasModem || !statsInterface) {
+            dataUsageAvailable = false;
+            return;
+        }
+        _rxFresh = false;
+        _txFresh = false;
+        counterRxFile.reload();
+        counterTxFile.reload();
+    }
+
+    property bool _rxFresh: false
+    property bool _txFresh: false
+
+    function adoptCounters() {
+        if (!_rxFresh || !_txFresh) return;
+        _rxFresh = false;
+        _txFresh = false;
+        {
+                const newRx = parseInt(counterRxFile.text(), 10) || 0;
+                const newTx = parseInt(counterTxFile.text(), 10) || 0;
 
                 // Roll the ledger over at midnight before accumulating.
                 const key = backendStore.usageDayKey();
@@ -796,7 +858,7 @@ PluginComponent {
                     backendStore._sampleTx = newTx;
                 }
 
-                const elapsed = 5;  // refresh() cadence in seconds
+                const elapsed = Math.max(1, counterTimer.interval / 1000);
                 backendStore.rxRate = Math.max(0, newRx - backendStore.prevRxBytes) / elapsed;
                 backendStore.txRate = Math.max(0, newTx - backendStore.prevTxBytes) / elapsed;
                 backendStore.prevRxBytes = backendStore.rxBytes;
@@ -807,8 +869,7 @@ PluginComponent {
 
                 if (backendStore._pendingRx + backendStore._pendingTx > 1048576)
                     backendStore.saveUsageHistory();
-            });
-        });
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -904,10 +965,18 @@ PluginComponent {
         // 窗口（默认 50ms）内被重复调用时，后一条会覆盖前一条，只有最后一条真正执行 ——
         // 曾因此导致「同一轮到的多条短信只弹最后一条」。不传 id 时内部改用随机键，
         // 且命令结束后会自动销毁计时器和条目（不会泄漏）。
+        // DMS 内置通知，不再依赖 libnotify 的 notify-send
+        // （CONTRIBUTING.md「Built-in Alternatives」）。参数对齐原语义：
+        // --app = 应用名，--icon = 图标，--timeout 9000ms。
         Proc.runCommand(undefined,
-            ["notify-send", "-a", "SIM Network", "-u", "normal", "-t", "9000",
-             "-i", backendStore.pluginIcon, title, body],
-            function () {}, 0);
+            ["dms", "notify", title, body,
+             "--app", "SIM Network", "--icon", backendStore.pluginIcon,
+             "--timeout", "9000"],
+            function (out, code) {
+                if (code !== 0)
+                    console.warn("[SimNetwork] dms notify failed: "
+                                 + String(out || "").slice(0, 120));
+            }, 0);
     }
 
     // 只对"会话启动之后新到的"消息弹提示：notifyReady 之前一律不弹。
@@ -1095,9 +1164,10 @@ PluginComponent {
     // 周期性兜底：万一被 SIGKILL 等极端情况留下停机状态，也能自己站起来
     Timer {
         id: mmWatchdog
-        interval: 20000
+        interval: 60000
         repeat: true
-        running: true
+        // 脚本没装就别起 sh（那是必然失败的一次子进程），没猫也没必要看门
+        running: backendStore.healHelperInstalled && backendStore.hasModem
         triggeredOnStart: true
         onTriggered: {
             // 只有在上次运行留下标记（$XDG_RUNTIME_DIR/eg25-mm-stopped）时才检查，避免多余调用
@@ -1149,16 +1219,18 @@ PluginComponent {
     }
 
     // Quickshell.clipboardText only updates an in-process value here — it never
-    // reaches the Wayland clipboard (verified: wl-paste stays empty). wl-copy
-    // does work, so use it and keep the Quickshell property as a fallback.
+    // reaches the Wayland clipboard (verified: wl-paste stays empty).
+    // 用 DMS 内置的 dms clipboard copy（CONTRIBUTING「Built-in Alternatives」），
+    // 它会同时进剪贴板历史；Quickshell 属性仍作兜底。
     function copyToClipboard(text) {
         const t = String(text || "");
         if (!t.length) return;
-        Proc.runCommand(backendStore.commandPrefix + ".clip", ["wl-copy", t],
+        Proc.runCommand(backendStore.commandPrefix + ".clip",
+            ["dms", "clipboard", "copy", t],
             function (output, code) {
                 if (code !== 0) {
                     Quickshell.clipboardText = t;
-                    console.warn("[SimNetwork] wl-copy exited " + code
+                    console.warn("[SimNetwork] dms clipboard exited " + code
                                  + "; fell back to Quickshell clipboard");
                 } else {
                     console.info("[SimNetwork] copied " + t.length + " chars");
@@ -1444,7 +1516,8 @@ PluginComponent {
                     // 失败常常是因为脚本中途被杀 → 停掉的 ModemManager 没起回来
                     mmHealTimer.restart();
                 }
-                if (code === 0 && m && m[1] === "0") mmHealTimer.restart();
+                // 成功路径不再排自愈：脚本自己会把 ModemManager 起回来，
+                // 这里再调一次只会平白重启服务（review R2）。
             });
     }
 
@@ -1797,6 +1870,16 @@ PluginComponent {
         return modems[0].id;
     }
 
+    // path -> 已解析的短信。review R1：原先每 30 秒给每条存量短信各起一个
+    // mmcli（23 条 = 23 个进程一轮），现在终态的短信直接用缓存，只查新的
+    // 和还在发送中的。
+    property var smsDetailCache: ({})
+
+    function smsStateSettled(state) {
+        const s = String(state || "").toLowerCase();
+        return s === "received" || s === "sent" || s === "stored";
+    }
+
     function loadSmsList() {
         const id = getModemId();
         if (!id) return;
@@ -1808,14 +1891,43 @@ PluginComponent {
                 // mmcli flattens the object path into the key: {"modem.messaging.sms": [...]}
                 const smsPaths = data["modem.messaging.sms"] || data["sms"] || [];
                 if (!smsPaths.length) {
+                    backendStore.smsDetailCache = {};
                     backendStore.smsMessages = [];
                     backendStore.recomputeUnread();
                     backendStore.smsListUpdated();
                     return;
                 }
-                const found = [];
-                let pending = smsPaths.length;
-                smsPaths.forEach((path) => {
+
+                const cache = {};
+                const old = backendStore.smsDetailCache || {};
+                const listed = {};
+                smsPaths.forEach((p) => { listed[p] = true; });
+                // 模组上已被删除的，从缓存里剔掉（历史台账里仍留着）
+                Object.keys(old).forEach((p) => { if (listed[p]) cache[p] = old[p]; });
+                backendStore.smsDetailCache = cache;
+
+                const publish = () => {
+                    // read 由"最新已读键"算出，不能跟着缓存冻住：
+                    // 用户刚在面板里标了已读，这一拍就得变灰。
+                    const found = smsPaths.map((p) => cache[p]).filter(Boolean).map((m) => Object.assign({}, m, {
+                        read: isSmsRead(m.number, m.text, m.timestamp, m.pduType)
+                    }));
+                    found.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
+                    backendStore.smsMessages = found;
+                    backendStore.importSmsToHistory(found);
+                    backendStore.recomputeUnread();
+                    backendStore.smsListUpdated();
+                };
+
+                // 只有"没见过的"和"状态还没落定的"才值得再起一个 mmcli
+                const stale = smsPaths.filter((p) => {
+                    const hit = cache[p];
+                    return !hit || !smsStateSettled(hit.state);
+                });
+                if (!stale.length) { publish(); return; }
+
+                let pending = stale.length;
+                stale.forEach((path) => {
                     const smsId = backendStore.modemId(path);
                     Proc.runCommand(backendStore.commandPrefix + ".sms." + smsId, ["mmcli", "--sms", smsId, "--output-json"], (smsInfo, smsCode) => {
                         if (smsCode === 0) {
@@ -1824,24 +1936,18 @@ PluginComponent {
                                 // number/text live under "content"; state/timestamp under "properties".
                                 const content = smsData.content || {};
                                 const props = smsData.properties || {};
-                                found.push({
+                                cache[path] = {
                                     path: path,
                                     number: clean(content.number || props.number || ""),
                                     text: clean(content.text || props.text || ""),
                                     timestamp: backendStore.normalizeStamp(clean(props.timestamp || "")),
                                     state: clean(props.state || ""),
-                                    read: isSmsRead(clean(content.number || ""), clean(content.text || ""), clean(props.timestamp || ""), clean(props["pdu-type"] || "")),
+                                    pduType: clean(props["pdu-type"] || ""),
                                     isSubmit: clean(props["pdu-type"] || "") === "submit"
-                                });
+                                };
                             } catch (e) {}
                         }
-                        if (--pending === 0) {
-                            found.sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""));
-                            backendStore.smsMessages = found;
-                            backendStore.importSmsToHistory(found);
-                            backendStore.recomputeUnread();
-                            backendStore.smsListUpdated();
-                        }
+                        if (--pending === 0) publish();
                     });
                 });
             } catch (e) {
