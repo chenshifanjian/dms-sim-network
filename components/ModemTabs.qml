@@ -209,7 +209,9 @@ ColumnLayout {
 
     // Local UI state (shared by every host instance)
     property int activeTab: 0
-    readonly property var tabNames: ["网络", "短信", "电话", "定位"]
+    // 通话页下线：EG25-G 固件锁死 VoLTE，README 也不承诺通话功能
+    //（review 第 7 轮：tab 里还挂着拨号/接听/挂断，与文档矛盾）。
+    readonly property var tabNames: ["网络", "短信", "定位"]
     property string smsRecipient: ""
     property string smsText: ""
     property string dialNumber: ""
@@ -631,7 +633,7 @@ ColumnLayout {
             text: {
                 if (!tabs.backend) return "";
                 if (!tabs.backend.quotaIsCurrentMonth())
-                    return "本月还没有账单：发 " + tabs.backend.quotaQueryText + " 到 " + tabs.backend.quotaQueryNumber + " 获取";
+                    return "本月还没有查询结果：发 " + tabs.backend.quotaQueryText + " 到 " + tabs.backend.quotaQueryNumber + " 获取";
                 const q = tabs.backend.quota;
                 return (q.source === "manual" ? "手动输入" : "运营商回复")
                      + " · " + String(q.at || "").slice(0, 16).replace("T", "")
@@ -1630,7 +1632,7 @@ ColumnLayout {
     ColumnLayout {
         id: tabPhone
         Layout.fillWidth: true
-        visible: tabs.activeTab === 2
+        visible: false   // 通话页已下线，见 tabNames 注释
         spacing: Theme.spacingS
 
         StyledText {
@@ -1744,7 +1746,7 @@ ColumnLayout {
     ColumnLayout {
         id: tabGps
         Layout.fillWidth: true
-        visible: tabs.activeTab === 3
+        visible: tabs.activeTab === 2
         spacing: Theme.spacingS
 
         RowLayout {
